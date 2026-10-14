@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"unsafe"
 
 	docker_container "github.com/moby/moby/api/types/container"
 	"github.com/nektos/act/pkg/common"
@@ -62,6 +63,12 @@ type Config struct {
 	ContainerNetworkMode               docker_container.NetworkMode // the network mode of job containers (the value of --network)
 	ActionCache                        ActionCache                  // Use a custom ActionCache Implementation
 	ConcurrentJobs                     int                          // Number of max concurrent jobs
+	StrictExpressions                  bool                         // when true, any failed expression interpolation terminates the run instead of replacing it with an empty string
+
+	// interpolationFailures is the atomically initialized *interpolationReporter
+	// which collects every interpolation failure of a run. Use
+	// Config.interpolationReporter() to access it.
+	interpolationFailures unsafe.Pointer
 }
 
 func (config *Config) GetConcurrentJobs() int {
@@ -97,6 +104,10 @@ func New(runnerConfig *Config) (Runner, error) {
 }
 
 func (runner *runnerImpl) configure() (Runner, error) {
+	// eagerly initialize the reporter so it is shared by every job and
+	// reusable workflow runner of this run and safe to access concurrently
+	runner.config.interpolationReporter()
+
 	runner.eventJSON = "{}"
 	if runner.config.EventPath != "" {
 		log.Debugf("Reading event.json from %s", runner.config.EventPath)
@@ -197,6 +208,13 @@ func (runner *runnerImpl) NewPlanExecutor(plan *model.Plan) common.Executor {
 						maxJobNameLen = len(rc.String())
 					}
 					stageExecutor = append(stageExecutor, func(ctx context.Context) error {
+						// in strict mode an interpolation failure that happened
+						// before the job was executed (e.g. the job name) aborts
+						// the job right here and lists all known failure points
+						if err := runner.config.interpolationReporter().err(); err != nil {
+							return err
+						}
+
 						jobName := fmt.Sprintf("%-*s", maxJobNameLen, rc.String())
 						executor, err := rc.Executor()
 
@@ -215,7 +233,18 @@ func (runner *runnerImpl) NewPlanExecutor(plan *model.Plan) common.Executor {
 		})
 	}
 
-	return common.NewPipelineExecutor(stagePipeline...).Then(handleFailure(plan))
+	planExecutor := common.NewPipelineExecutor(stagePipeline...).Then(handleFailure(plan))
+
+	// only the top level runner reports the collected failures, reusable
+	// workflow runners share the same reporter with the main run
+	if runner.caller == nil {
+		planExecutor = planExecutor.Finally(func(ctx context.Context) error {
+			runner.config.interpolationReporter().flush(ctx)
+			return nil
+		})
+	}
+
+	return planExecutor
 }
 
 func handleFailure(plan *model.Plan) common.Executor {
@@ -260,7 +289,7 @@ func (runner *runnerImpl) newRunContext(ctx context.Context, run *model.Run, mat
 		caller:      runner.caller,
 	}
 	rc.ExprEval = rc.NewExpressionEvaluator(ctx)
-	rc.Name = rc.ExprEval.Interpolate(ctx, run.String())
+	rc.Name, _ = rc.ExprEval.Interpolate(ctx, "name", run.String())
 
 	return rc
 }

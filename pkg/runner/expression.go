@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"reflect"
@@ -23,7 +24,14 @@ import (
 type ExpressionEvaluator interface {
 	evaluate(context.Context, string, exprparser.DefaultStatusCheck) (interface{}, error)
 	EvaluateYamlNode(context.Context, *yaml.Node) error
-	Interpolate(context.Context, string) string
+	// Interpolate evaluates all expressions in in and returns the result.
+	// fieldPath identifies the workflow field the expression belongs to
+	// (relative to the job, e.g. "services.db.image"); it is used to
+	// attribute interpolation failures.
+	// In the default fault tolerant mode a failed interpolation returns an
+	// empty string and no error, the failure is still recorded and logged.
+	// In strict mode it returns an error listing all known failure points.
+	Interpolate(ctx context.Context, fieldPath string, in string) (string, error)
 }
 
 // NewExpressionEvaluator creates a new evaluator
@@ -95,6 +103,7 @@ func (rc *RunContext) NewExpressionEvaluatorWithEnv(ctx context.Context, env map
 		ee.Runner = rc.JobContainer.GetRunnerContext(ctx)
 	}
 	return expressionEvaluator{
+		rc: rc,
 		interpreter: exprparser.NewInterpeter(ee, exprparser.Config{
 			Run:        rc.Run,
 			WorkingDir: rc.Config.Workdir,
@@ -159,6 +168,7 @@ func (rc *RunContext) newStepExpressionEvaluator(ctx context.Context, step step,
 		ee.Runner = rc.JobContainer.GetRunnerContext(ctx)
 	}
 	return expressionEvaluator{
+		rc: rc,
 		interpreter: exprparser.NewInterpeter(ee, exprparser.Config{
 			Run:        rc.Run,
 			WorkingDir: rc.Config.Workdir,
@@ -229,6 +239,7 @@ func getHashFilesFunction(ctx context.Context, rc *RunContext) func(v []reflect.
 }
 
 type expressionEvaluator struct {
+	rc          *RunContext
 	interpreter exprparser.Interpreter
 }
 
@@ -251,7 +262,10 @@ func (ee expressionEvaluator) evaluateScalarYamlNode(ctx context.Context, node *
 	if !strings.Contains(in, "${{") || !strings.Contains(in, "}}") {
 		return nil, nil
 	}
-	expr, _ := rewriteSubExpression(ctx, in, false)
+	expr, err := rewriteSubExpression(ctx, in, false)
+	if err != nil {
+		return nil, err
+	}
 	res, err := ee.evaluate(ctx, expr, exprparser.DefaultStatusCheckNone)
 	if err != nil {
 		return nil, err
@@ -377,29 +391,117 @@ func (ee expressionEvaluator) EvaluateYamlNode(ctx context.Context, node *yaml.N
 	return nil
 }
 
-func (ee expressionEvaluator) Interpolate(ctx context.Context, in string) string {
+func (ee expressionEvaluator) Interpolate(ctx context.Context, fieldPath string, in string) (string, error) {
 	if !strings.Contains(in, "${{") || !strings.Contains(in, "}}") {
-		return in
+		return in, nil
 	}
 
-	expr, _ := rewriteSubExpression(ctx, in, true)
+	expr, err := rewriteSubExpression(ctx, in, true)
+	if err != nil {
+		return ee.handleInterpolationError(ctx, fieldPath, in, err)
+	}
+
 	evaluated, err := ee.evaluate(ctx, expr, exprparser.DefaultStatusCheckNone)
 	if err != nil {
-		common.Logger(ctx).Errorf("Unable to interpolate expression '%s': %s", expr, err)
-		return ""
+		// failures of nested sub expressions are attributed to the field that
+		// contains them, while still keeping the original expression text
+		return ee.handleInterpolationError(ctx, fieldPath, in, err)
 	}
 
 	value, ok := evaluated.(string)
 	if !ok {
-		panic(fmt.Sprintf("Expression %s did not evaluate to a string", expr))
+		err := &exprparser.Error{
+			Stage:  exprparser.FailureStageEvaluate,
+			Reason: exprparser.FailureReasonTypeMismatch,
+			Message: fmt.Sprintf(
+				"Expression %s did not evaluate to a string (expected string, got %s)",
+				expr, actualTypeName(evaluated),
+			),
+		}
+		return ee.handleInterpolationError(ctx, fieldPath, in, err)
 	}
 
-	return value
+	return value, nil
+}
+
+// handleInterpolationError records the failure with its field location and
+// either reports it as an aggregated error (strict mode) or returns an empty
+// string without an error (default fault tolerant mode).
+func (ee expressionEvaluator) handleInterpolationError(ctx context.Context, fieldPath string, in string, cause error) (string, error) {
+	failure := ee.toInterpolationFailure(fieldPath, in, cause)
+	reporter := ee.interpolationReporter()
+	reporter.record(failure)
+
+	common.Logger(ctx).
+		WithField("file", failure.File).
+		WithField("field", failure.FieldPath).
+		WithField("stage", string(failure.Stage)).
+		WithField("reason", string(failure.Reason)).
+		Debugf("Expression interpolation failed for %q: %s", failure.Expr, failure.Message)
+
+	if reporter.strict {
+		return "", reporter.err()
+	}
+
+	return "", nil
+}
+
+func (ee expressionEvaluator) toInterpolationFailure(fieldPath string, in string, cause error) InterpolationFailure {
+	failure := InterpolationFailure{
+		FieldPath: ee.qualifiedFieldPath(fieldPath),
+		Expr:      in,
+	}
+
+	if ee.rc != nil && ee.rc.Run != nil && ee.rc.Run.Workflow != nil {
+		failure.File = ee.rc.Run.Workflow.File
+	}
+
+	var exprErr *exprparser.Error
+	if errors.As(cause, &exprErr) {
+		failure.Stage = exprErr.Stage
+		failure.Reason = exprErr.Reason
+		failure.Message = exprErr.Message
+	} else {
+		failure.Stage = exprparser.FailureStageEvaluate
+		failure.Reason = exprparser.FailureReasonEvaluation
+		failure.Message = cause.Error()
+	}
+
+	return failure
+}
+
+func (ee expressionEvaluator) qualifiedFieldPath(fieldPath string) string {
+	if ee.rc != nil && ee.rc.Run != nil && ee.rc.Run.JobID != "" {
+		if fieldPath != "" {
+			return fmt.Sprintf("jobs.%s.%s", ee.rc.Run.JobID, fieldPath)
+		}
+		return fmt.Sprintf("jobs.%s", ee.rc.Run.JobID)
+	}
+	return fieldPath
+}
+
+func actualTypeName(value interface{}) string {
+	if value == nil {
+		return "null"
+	}
+	return reflect.TypeOf(value).String()
+}
+
+func (ee expressionEvaluator) interpolationReporter() *interpolationReporter {
+	if ee.rc == nil || ee.rc.Config == nil {
+		// evaluators are always created through a RunContext in production,
+		// this is only a safeguard for unusual constructions
+		return newInterpolationReporter(false)
+	}
+	return ee.rc.interpolationReporter()
 }
 
 // EvalBool evaluates an expression against given evaluator
 func EvalBool(ctx context.Context, evaluator ExpressionEvaluator, expr string, defaultStatusCheck exprparser.DefaultStatusCheck) (bool, error) {
-	nextExpr, _ := rewriteSubExpression(ctx, expr, false)
+	nextExpr, err := rewriteSubExpression(ctx, expr, false)
+	if err != nil {
+		return false, err
+	}
 
 	evaluated, err := evaluator.evaluate(ctx, nextExpr, defaultStatusCheck)
 	if err != nil {
@@ -428,7 +530,11 @@ func rewriteSubExpression(ctx context.Context, in string, forceFormat bool) (str
 		if strStart > -1 {
 			matches := strPattern.FindStringIndex(in[pos:])
 			if matches == nil {
-				panic("unclosed string.")
+				return "", &exprparser.Error{
+					Stage:   exprparser.FailureStageParse,
+					Reason:  exprparser.FailureReasonSyntax,
+					Message: "unclosed string.",
+				}
 			}
 
 			strStart = -1
@@ -453,7 +559,11 @@ func rewriteSubExpression(ctx context.Context, in string, forceFormat bool) (str
 			} else if strStart > -1 {
 				pos += strStart + 1
 			} else {
-				panic("unclosed expression.")
+				return "", &exprparser.Error{
+					Stage:   exprparser.FailureStageParse,
+					Reason:  exprparser.FailureReasonSyntax,
+					Message: "unclosed expression.",
+				}
 			}
 		} else {
 			exprStart = strings.Index(in[pos:], "${{")
@@ -580,7 +690,11 @@ func getWorkflowSecrets(ctx context.Context, rc *RunContext) map[string]string {
 		}
 
 		for k, v := range secrets {
-			secrets[k] = rc.caller.runContext.ExprEval.Interpolate(ctx, v)
+			// failures are recorded on the calling workflow run and handled
+			// at its execution boundaries; secret evaluation cannot return an
+			// error here as it happens while building the evaluator
+			interpolated, _ := rc.caller.runContext.ExprEval.Interpolate(ctx, fmt.Sprintf("secrets.%s", k), v)
+			secrets[k] = interpolated
 		}
 
 		return secrets

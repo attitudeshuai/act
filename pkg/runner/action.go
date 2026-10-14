@@ -220,7 +220,9 @@ func setupActionEnv(ctx context.Context, step actionStep, _ *remoteAction) error
 	// the action
 	rc.withGithubEnv(ctx, step.getGithubContext(ctx), *step.getEnv())
 	populateEnvsFromSavedState(step.getEnv(), step, rc)
-	populateEnvsFromInput(ctx, step.getEnv(), step.getActionModel(), rc)
+	if err := populateEnvsFromInput(ctx, step.getEnv(), step.getActionModel(), rc, step.getStepModel().ID); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -249,6 +251,7 @@ func execAsDocker(ctx context.Context, step actionStep, actionName, basedir, sub
 	logger := common.Logger(ctx)
 	rc := step.getRunContext()
 	action := step.getActionModel()
+	stepModel := step.getStepModel()
 
 	var prepImage common.Executor
 	var image string
@@ -313,16 +316,26 @@ func execAsDocker(ctx context.Context, step actionStep, actionName, basedir, sub
 		}
 	}
 	eval := rc.NewStepExpressionEvaluator(ctx, step)
-	cmd, err := shellquote.Split(eval.Interpolate(ctx, step.getStepModel().With["args"]))
+	interpolatedArgs, err := eval.Interpolate(ctx, fmt.Sprintf("steps.%s.with.args", stepModel.ID), stepModel.With["args"])
+	if err != nil {
+		return err
+	}
+	cmd, err := shellquote.Split(interpolatedArgs)
 	if err != nil {
 		return err
 	}
 	if len(cmd) == 0 {
 		cmd = action.Runs.Args
-		evalDockerArgs(ctx, step, action, &cmd)
+		if err := evalDockerArgs(ctx, step, action, &cmd); err != nil {
+			return err
+		}
 	}
 
-	entrypoint := strings.Fields(eval.Interpolate(ctx, step.getStepModel().With[entrypointType]))
+	interpolatedEntrypoint, err := eval.Interpolate(ctx, fmt.Sprintf("steps.%s.with.entrypoint", stepModel.ID), stepModel.With[entrypointType])
+	if err != nil {
+		return err
+	}
+	entrypoint := strings.Fields(interpolatedEntrypoint)
 	if len(entrypoint) == 0 {
 		if entrypointType == "pre-entrypoint" && action.Runs.PreEntrypoint != "" {
 			entrypoint, err = shellquote.Split(action.Runs.PreEntrypoint)
@@ -355,33 +368,51 @@ func execAsDocker(ctx context.Context, step actionStep, actionName, basedir, sub
 	).Finally(stepContainer.Close())(ctx)
 }
 
-func evalDockerArgs(ctx context.Context, step step, action *model.Action, cmd *[]string) {
+func evalDockerArgs(ctx context.Context, step step, action *model.Action, cmd *[]string) error {
 	rc := step.getRunContext()
 	stepModel := step.getStepModel()
+	stepField := fmt.Sprintf("steps.%s", stepModel.ID)
 
 	inputs := make(map[string]string)
 	eval := rc.NewExpressionEvaluator(ctx)
 	// Set Defaults
 	for k, input := range action.Inputs {
-		inputs[k] = eval.Interpolate(ctx, input.Default)
+		interpolated, err := eval.Interpolate(ctx, fmt.Sprintf("%s.inputs.%s.default", stepField, k), input.Default)
+		if err != nil {
+			return err
+		}
+		inputs[k] = interpolated
 	}
 	if stepModel.With != nil {
 		for k, v := range stepModel.With {
-			inputs[k] = eval.Interpolate(ctx, v)
+			interpolated, err := eval.Interpolate(ctx, fmt.Sprintf("%s.with.%s", stepField, k), v)
+			if err != nil {
+				return err
+			}
+			inputs[k] = interpolated
 		}
 	}
 	mergeIntoMap(step, step.getEnv(), inputs)
 
 	stepEE := rc.NewStepExpressionEvaluator(ctx, step)
 	for i, v := range *cmd {
-		(*cmd)[i] = stepEE.Interpolate(ctx, v)
+		interpolated, err := stepEE.Interpolate(ctx, fmt.Sprintf("%s.runs.args[%d]", stepField, i), v)
+		if err != nil {
+			return err
+		}
+		(*cmd)[i] = interpolated
 	}
 	mergeIntoMap(step, step.getEnv(), action.Runs.Env)
 
 	ee := rc.NewStepExpressionEvaluator(ctx, step)
 	for k, v := range *step.getEnv() {
-		(*step.getEnv())[k] = ee.Interpolate(ctx, v)
+		interpolated, err := ee.Interpolate(ctx, fmt.Sprintf("%s.env.%s", stepField, k), v)
+		if err != nil {
+			return err
+		}
+		(*step.getEnv())[k] = interpolated
 	}
+	return nil
 }
 
 func newStepContainer(ctx context.Context, step step, image string, cmd []string, entrypoint []string) container.Container {
@@ -448,15 +479,20 @@ func populateEnvsFromSavedState(env *map[string]string, step actionStep, rc *Run
 	}
 }
 
-func populateEnvsFromInput(ctx context.Context, env *map[string]string, action *model.Action, rc *RunContext) {
+func populateEnvsFromInput(ctx context.Context, env *map[string]string, action *model.Action, rc *RunContext, stepID string) error {
 	eval := rc.NewExpressionEvaluator(ctx)
 	for inputID, input := range action.Inputs {
 		envKey := regexp.MustCompile("[^A-Z0-9-]").ReplaceAllString(strings.ToUpper(inputID), "_")
 		envKey = fmt.Sprintf("INPUT_%s", envKey)
 		if _, ok := (*env)[envKey]; !ok {
-			(*env)[envKey] = eval.Interpolate(ctx, input.Default)
+			interpolated, err := eval.Interpolate(ctx, fmt.Sprintf("steps.%s.inputs.%s.default", stepID, inputID), input.Default)
+			if err != nil {
+				return err
+			}
+			(*env)[envKey] = interpolated
 		}
 	}
+	return nil
 }
 
 func getContainerActionPaths(step *model.Step, actionDir string, rc *RunContext) (string, string) {
@@ -524,7 +560,9 @@ func runPreStep(step actionStep) common.Executor {
 		action := step.getActionModel()
 
 		// defaults in pre steps were missing, however provided inputs are available
-		populateEnvsFromInput(ctx, step.getEnv(), action, rc)
+		if err := populateEnvsFromInput(ctx, step.getEnv(), action, rc, stepModel.ID); err != nil {
+			return err
+		}
 
 		// todo: refactor into step
 		var actionDir string
@@ -656,7 +694,9 @@ func runPostStep(step actionStep) common.Executor {
 		switch {
 		case x.IsNode():
 			populateEnvsFromSavedState(step.getEnv(), step, rc)
-			populateEnvsFromInput(ctx, step.getEnv(), step.getActionModel(), rc)
+			if err := populateEnvsFromInput(ctx, step.getEnv(), step.getActionModel(), rc, stepModel.ID); err != nil {
+				return err
+			}
 
 			containerArgs := []string{rc.GetNodeToolFullPath(ctx), path.Join(containerActionDir, action.Runs.Post)}
 			logger.Debugf("executing remote job container: %s", containerArgs)

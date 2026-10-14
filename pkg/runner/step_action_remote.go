@@ -163,7 +163,11 @@ func (sar *stepActionRemote) main() common.Executor {
 					return nil
 				}
 				eval := sar.RunContext.NewExpressionEvaluator(ctx)
-				copyToPath := path.Join(sar.RunContext.JobContainer.ToContainerPath(sar.RunContext.Config.Workdir), eval.Interpolate(ctx, sar.Step.With["path"]))
+				interpolatedPath, err := eval.Interpolate(ctx, fmt.Sprintf("steps.%s.with.path", sar.Step.ID), sar.Step.With["path"])
+				if err != nil {
+					return err
+				}
+				copyToPath := path.Join(sar.RunContext.JobContainer.ToContainerPath(sar.RunContext.Config.Workdir), interpolatedPath)
 				return sar.RunContext.JobContainer.CopyDir(copyToPath, sar.RunContext.Config.Workdir+string(filepath.Separator)+".", sar.RunContext.Config.UseGitIgnore)(ctx)
 			}
 

@@ -262,7 +262,8 @@ func TestInterpolate(t *testing.T) {
 	for _, table := range tables {
 		t.Run("interpolate", func(t *testing.T) {
 			assertObject := assert.New(t)
-			out := ee.Interpolate(context.Background(), table.in)
+			out, err := ee.Interpolate(context.Background(), "test", table.in)
+			assertObject.NoError(err, table.in)
 			assertObject.Equal(table.out, out, table.in)
 		})
 	}

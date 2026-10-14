@@ -48,7 +48,11 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 		// evaluate environment variables since they can contain
 		// GitHub's special environment variables.
 		for k, v := range rc.GetEnv() {
-			rc.Env[k] = rc.ExprEval.Interpolate(ctx, v)
+			interpolated, err := rc.ExprEval.Interpolate(ctx, fmt.Sprintf("env.%s", k), v)
+			if err != nil {
+				return err
+			}
+			rc.Env[k] = interpolated
 		}
 		return nil
 	})
@@ -83,11 +87,22 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 
 		stepExec := step.main()
 		steps = append(steps, useStepLogger(rc, stepModel, stepStageMain, func(ctx context.Context) error {
+			// an interpolation failure recorded outside of an error
+			// returning call site aborts the remaining steps in strict mode
+			if err := rc.interpolationReporter().err(); err != nil {
+				return err
+			}
 			err := stepExec(ctx)
 			if err != nil {
 				_ = setJobError(ctx, err)
 			} else if ctx.Err() != nil {
 				_ = setJobError(ctx, ctx.Err())
+			} else if interpolationErr := rc.interpolationReporter().err(); interpolationErr != nil {
+				// a step recorded an interpolation failure without returning
+				// an error (e.g. while resolving the working directory);
+				// terminate the remaining steps in strict mode
+				_ = setJobError(ctx, interpolationErr)
+				return interpolationErr
 			}
 			return nil
 		}))
@@ -121,8 +136,7 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 	var setJobResultExecutor common.Executor = func(ctx context.Context) error {
 		jobError := common.JobError(ctx)
 		setJobResult(ctx, info, rc, jobError == nil)
-		setJobOutputs(ctx, rc)
-		return nil
+		return setJobOutputs(ctx, rc)
 	}
 
 	pipeline := make([]common.Executor, 0)
@@ -182,7 +196,7 @@ func setJobResult(ctx context.Context, info jobInfo, rc *RunContext, success boo
 	logger.WithField("jobResult", jobResult).Infof("\U0001F3C1  Job %s", jobResultMessage)
 }
 
-func setJobOutputs(ctx context.Context, rc *RunContext) {
+func setJobOutputs(ctx context.Context, rc *RunContext) error {
 	if rc.caller != nil {
 		// map outputs for reusable workflows
 		callerOutputs := make(map[string]string)
@@ -190,16 +204,32 @@ func setJobOutputs(ctx context.Context, rc *RunContext) {
 		ee := rc.NewExpressionEvaluator(ctx)
 
 		for k, v := range rc.Run.Workflow.WorkflowCallConfig().Outputs {
-			callerOutputs[k] = ee.Interpolate(ctx, ee.Interpolate(ctx, v.Value))
+			// failures of the inner interpolation are attributed to the
+			// same outer output field
+			field := fmt.Sprintf("outputs.%s", k)
+			value, err := ee.Interpolate(ctx, field, v.Value)
+			if err != nil {
+				return err
+			}
+			value, err = ee.Interpolate(ctx, field, value)
+			if err != nil {
+				return err
+			}
+			callerOutputs[k] = value
 		}
 
 		rc.caller.runContext.Run.Job().Outputs = callerOutputs
 	}
+	return nil
 }
 
 func useStepLogger(rc *RunContext, stepModel *model.Step, stage stepStage, executor common.Executor) common.Executor {
 	return func(ctx context.Context) error {
-		ctx = withStepLogger(ctx, stepModel.ID, rc.ExprEval.Interpolate(ctx, stepModel.String()), stage.String())
+		name, err := rc.ExprEval.Interpolate(ctx, fmt.Sprintf("steps.%s.name", stepModel.ID), stepModel.String())
+		if err != nil {
+			return err
+		}
+		ctx = withStepLogger(ctx, stepModel.ID, name, stage.String())
 
 		rawLogger := common.Logger(ctx).WithField("raw_output", true)
 		logWriter := common.NewLineWriter(rc.commandHandler(ctx), func(s string) bool {

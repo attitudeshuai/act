@@ -62,6 +62,65 @@ func (dsc DefaultStatusCheck) String() string {
 	return ""
 }
 
+// FailureStage describes at which point of processing an expression
+// the failure occurred.
+type FailureStage string
+
+const (
+	// FailureStageParse is set when the expression could not be parsed.
+	FailureStageParse FailureStage = "parse"
+	// FailureStageEvaluate is set when the expression parsed but failed
+	// while it was evaluated.
+	FailureStageEvaluate FailureStage = "evaluate"
+)
+
+// FailureReason categorizes the reason of an expression failure.
+type FailureReason string
+
+const (
+	// FailureReasonSyntax is a syntax error reported by the parser.
+	FailureReasonSyntax FailureReason = "syntax"
+	// FailureReasonUnavailableContext means that the expression references
+	// a context which is not available (e.g. an unknown context name or
+	// the jobs context outside of a workflow call).
+	FailureReasonUnavailableContext FailureReason = "unavailable-context"
+	// FailureReasonTypeMismatch means that the result of an expression had
+	// a different type than expected by the caller.
+	FailureReasonTypeMismatch FailureReason = "type-mismatch"
+	// FailureReasonEvaluation is any other failure that occurred while the
+	// expression was evaluated.
+	FailureReasonEvaluation FailureReason = "evaluation"
+)
+
+// Error is a structured expression error. The Error() text is kept stable
+// for backwards compatibility, callers should use the Stage and Reason
+// fields to distinguish the different failure classes.
+type Error struct {
+	Stage   FailureStage
+	Reason  FailureReason
+	Message string
+}
+
+func (e *Error) Error() string {
+	return e.Message
+}
+
+func newParseError(message string) *Error {
+	return &Error{
+		Stage:   FailureStageParse,
+		Reason:  FailureReasonSyntax,
+		Message: message,
+	}
+}
+
+func newEvaluationError(reason FailureReason, format string, args ...interface{}) *Error {
+	return &Error{
+		Stage:   FailureStageEvaluate,
+		Reason:  reason,
+		Message: fmt.Sprintf(format, args...),
+	}
+}
+
 type Interpreter interface {
 	Evaluate(input string, defaultStatusCheck DefaultStatusCheck) (interface{}, error)
 }
@@ -86,7 +145,7 @@ func (impl *interperterImpl) Evaluate(input string, defaultStatusCheck DefaultSt
 	parser := actionlint.NewExprParser()
 	exprNode, err := parser.Parse(actionlint.NewExprLexer(input + "}}"))
 	if err != nil {
-		return nil, fmt.Errorf("Failed to parse: %s", err.Message)
+		return nil, newParseError(fmt.Sprintf("Failed to parse: %s", err.Message))
 	}
 
 	if defaultStatusCheck != DefaultStatusCheckNone {
@@ -146,7 +205,7 @@ func (impl *interperterImpl) evaluateNode(exprNode actionlint.ExprNode) (interfa
 	case *actionlint.FuncCallNode:
 		return impl.evaluateFuncCall(node)
 	default:
-		return nil, fmt.Errorf("Fatal error! Unknown node type: %s node: %+v", reflect.TypeOf(exprNode), exprNode)
+		return nil, newEvaluationError(FailureReasonEvaluation, "Fatal error! Unknown node type: %s node: %+v", reflect.TypeOf(exprNode), exprNode)
 	}
 }
 
@@ -160,7 +219,7 @@ func (impl *interperterImpl) evaluateVariable(variableNode *actionlint.VariableN
 		return impl.env.Job, nil
 	case "jobs":
 		if impl.env.Jobs == nil {
-			return nil, fmt.Errorf("Unavailable context: jobs")
+			return nil, newEvaluationError(FailureReasonUnavailableContext, "Unavailable context: jobs")
 		}
 		return impl.env.Jobs, nil
 	case "steps":
@@ -184,7 +243,7 @@ func (impl *interperterImpl) evaluateVariable(variableNode *actionlint.VariableN
 	case "nan":
 		return math.NaN(), nil
 	default:
-		return nil, fmt.Errorf("Unavailable context: %s", variableNode.Name)
+		return nil, newEvaluationError(FailureReasonUnavailableContext, "Unavailable context: %s", variableNode.Name)
 	}
 }
 
@@ -292,7 +351,7 @@ func (impl *interperterImpl) getPropertyValue(left reflect.Value, property strin
 				}
 
 			default:
-				return nil, fmt.Errorf("'%s' in map key not implemented", key.Kind())
+				return nil, newEvaluationError(FailureReasonEvaluation, "'%s' in map key not implemented", key.Kind())
 			}
 		}
 
@@ -414,10 +473,10 @@ func (impl *interperterImpl) compareValues(leftValue reflect.Value, rightValue r
 		}
 
 		// not possible situation - params are converted to the same type in code above
-		return nil, fmt.Errorf("Compare params of Invalid type: left: %+v, right: %+v", leftValue.Kind(), rightValue.Kind())
+		return nil, newEvaluationError(FailureReasonEvaluation, "Compare params of Invalid type: left: %+v, right: %+v", leftValue.Kind(), rightValue.Kind())
 
 	default:
-		return nil, fmt.Errorf("Compare not implemented for types: left: %+v, right: %+v", leftValue.Kind(), rightValue.Kind())
+		return nil, newEvaluationError(FailureReasonEvaluation, "Compare not implemented for types: left: %+v, right: %+v", leftValue.Kind(), rightValue.Kind())
 	}
 }
 
@@ -505,7 +564,7 @@ func (impl *interperterImpl) compareString(left string, right string, kind actio
 	case actionlint.CompareOpNodeKindNotEq:
 		return left != right, nil
 	default:
-		return false, fmt.Errorf("TODO: not implemented to compare '%+v'", kind)
+		return false, newEvaluationError(FailureReasonEvaluation, "TODO: not implemented to compare '%+v'", kind)
 	}
 }
 
@@ -524,7 +583,7 @@ func (impl *interperterImpl) compareNumber(left float64, right float64, kind act
 	case actionlint.CompareOpNodeKindNotEq:
 		return left != right, nil
 	default:
-		return false, fmt.Errorf("TODO: not implemented to compare '%+v'", kind)
+		return false, newEvaluationError(FailureReasonEvaluation, "TODO: not implemented to compare '%+v'", kind)
 	}
 }
 
@@ -604,7 +663,7 @@ func (impl *interperterImpl) evaluateLogicalCompare(compareNode *actionlint.Logi
 		return impl.getSafeValue(rightValue), nil
 	}
 
-	return nil, fmt.Errorf("Unable to compare incompatibles types '%s' and '%s'", leftValue.Kind(), rightValue.Kind())
+	return nil, newEvaluationError(FailureReasonEvaluation, "Unable to compare incompatibles types '%s' and '%s'", leftValue.Kind(), rightValue.Kind())
 }
 
 //nolint:gocyclo
@@ -652,7 +711,7 @@ func (impl *interperterImpl) evaluateFuncCall(funcCallNode *actionlint.FuncCallN
 		if impl.config.Context == "step" {
 			return impl.stepSuccess()
 		}
-		return nil, fmt.Errorf("Context '%s' must be one of 'job' or 'step'", impl.config.Context)
+		return nil, newEvaluationError(FailureReasonEvaluation, "Context '%s' must be one of 'job' or 'step'", impl.config.Context)
 	case "failure":
 		if impl.config.Context == "job" {
 			return impl.jobFailure()
@@ -660,10 +719,10 @@ func (impl *interperterImpl) evaluateFuncCall(funcCallNode *actionlint.FuncCallN
 		if impl.config.Context == "step" {
 			return impl.stepFailure()
 		}
-		return nil, fmt.Errorf("Context '%s' must be one of 'job' or 'step'", impl.config.Context)
+		return nil, newEvaluationError(FailureReasonEvaluation, "Context '%s' must be one of 'job' or 'step'", impl.config.Context)
 	case "cancelled":
 		return impl.cancelled()
 	default:
-		return nil, fmt.Errorf("TODO: '%s' not implemented", funcCallNode.Callee)
+		return nil, newEvaluationError(FailureReasonEvaluation, "TODO: '%s' not implemented", funcCallNode.Callee)
 	}
 }

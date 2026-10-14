@@ -33,8 +33,10 @@ func evaluateCompositeInputAndEnv(ctx context.Context, parent *RunContext, step 
 		if value, ok := stepEnv[envKey]; defined && ok {
 			env[envKey] = value
 		} else {
-			// defaults could contain expressions
-			env[envKey] = ee.Interpolate(ctx, input.Default)
+			// defaults could contain expressions; a failure is recorded on
+			// the parent run and surfaced at the composite execution boundary
+			interpolated, _ := ee.Interpolate(ctx, fmt.Sprintf("steps.%s.inputs.%s.default", step.getStepModel().ID, inputID), input.Default)
+			env[envKey] = interpolated
 		}
 	}
 	gh := step.getGithubContext(ctx)
@@ -58,6 +60,9 @@ func newCompositeRunContext(ctx context.Context, parent *RunContext, step action
 		Run: &model.Run{
 			JobID: parent.Run.JobID,
 			Workflow: &model.Workflow{
+				// attribute interpolation failures of the composite action
+				// to the workflow file that invokes it
+				File: parent.Run.Workflow.File,
 				Name: parent.Run.Workflow.Name,
 				Jobs: map[string]*model.Job{
 					parent.Run.JobID: {},
@@ -86,6 +91,12 @@ func execAsComposite(step actionStep) common.Executor {
 	action := step.getActionModel()
 
 	return func(ctx context.Context) error {
+		// an interpolation failure recorded while building the composite
+		// inputs (e.g. a broken input default) aborts in strict mode
+		if err := rc.interpolationReporter().err(); err != nil {
+			return err
+		}
+
 		compositeRC := step.getCompositeRunContext(ctx)
 
 		steps := step.getCompositeSteps()
@@ -101,9 +112,13 @@ func execAsComposite(step actionStep) common.Executor {
 		// Map outputs from composite RunContext to job RunContext
 		eval := compositeRC.NewExpressionEvaluator(ctx)
 		for outputName, output := range action.Outputs {
+			value, interpolateErr := eval.Interpolate(ctx, fmt.Sprintf("steps.%s.outputs.%s", step.getStepModel().ID, outputName), output.Value)
+			if interpolateErr != nil {
+				return interpolateErr
+			}
 			rc.setOutput(ctx, map[string]string{
 				"name": outputName,
-			}, eval.Interpolate(ctx, output.Value))
+			}, value)
 		}
 
 		rc.Masks = append(rc.Masks, compositeRC.Masks...)

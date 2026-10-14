@@ -68,6 +68,7 @@ func createRootCommand(ctx context.Context, input *Input, version string) *cobra
 	rootCmd.Flags().BoolP("watch", "w", false, "watch the contents of the local repo and run when files change")
 	rootCmd.Flags().BoolVar(&input.validate, "validate", false, "validate workflows")
 	rootCmd.Flags().BoolVar(&input.strict, "strict", false, "use strict workflow schema")
+	rootCmd.Flags().BoolVar(&input.strictExpressions, "strict-expressions", false, "terminate the run when an expression interpolation fails instead of replacing the result with an empty string")
 	rootCmd.Flags().BoolP("list", "l", false, "list workflows")
 	rootCmd.Flags().BoolP("graph", "g", false, "draw workflows")
 	rootCmd.Flags().StringP("job", "j", "", "run a specific job ID")
@@ -645,6 +646,7 @@ func newRunCommand(ctx context.Context, input *Input) func(*cobra.Command, []str
 			Matrix:                             matrixes,
 			ContainerNetworkMode:               docker_container.NetworkMode(input.networkName),
 			ConcurrentJobs:                     input.concurrentJobs,
+			StrictExpressions:                  input.strictExpressions,
 		}
 		if input.useNewActionCache || len(input.localRepository) > 0 {
 			if input.actionOfflineMode {

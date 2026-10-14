@@ -62,14 +62,22 @@ func (sd *stepDocker) runUsesContainer() common.Executor {
 	return func(ctx context.Context) error {
 		image := strings.TrimPrefix(step.Uses, "docker://")
 		eval := rc.NewExpressionEvaluator(ctx)
-		cmd, err := shellquote.Split(eval.Interpolate(ctx, step.With["args"]))
+		interpolatedArgs, err := eval.Interpolate(ctx, fmt.Sprintf("steps.%s.with.args", step.ID), step.With["args"])
+		if err != nil {
+			return err
+		}
+		cmd, err := shellquote.Split(interpolatedArgs)
 		if err != nil {
 			return err
 		}
 
 		var entrypoint []string
-		if entry := eval.Interpolate(ctx, step.With["entrypoint"]); entry != "" {
-			entrypoint = []string{entry}
+		interpolatedEntrypoint, err := eval.Interpolate(ctx, fmt.Sprintf("steps.%s.with.entrypoint", step.ID), step.With["entrypoint"])
+		if err != nil {
+			return err
+		}
+		if interpolatedEntrypoint != "" {
+			entrypoint = []string{interpolatedEntrypoint}
 		}
 
 		stepContainer := sd.newStepContainer(ctx, image, cmd, entrypoint)

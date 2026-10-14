@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -94,13 +93,13 @@ func (impl *interperterImpl) format(str reflect.Value, replaceValue ...reflect.V
 			case '}':
 				index, err := strconv.ParseInt(replacementIndex, 10, 32)
 				if err != nil {
-					return "", fmt.Errorf("The following format string is invalid: '%s'", input)
+					return "", newEvaluationError(FailureReasonEvaluation, "The following format string is invalid: '%s'", input)
 				}
 
 				replacementIndex = ""
 
 				if len(replaceValue) <= int(index) {
-					return "", fmt.Errorf("The following format string references more arguments than were supplied: '%s'", input)
+					return "", newEvaluationError(FailureReasonEvaluation, "The following format string references more arguments than were supplied: '%s'", input)
 				}
 
 				output += impl.coerceToString(replaceValue[index]).String()
@@ -119,7 +118,7 @@ func (impl *interperterImpl) format(str reflect.Value, replaceValue ...reflect.V
 				state = passThrough
 
 			default:
-				panic("Invalid format parser state")
+				return "", newEvaluationError(FailureReasonSyntax, "The following format string is invalid: '%s'", input)
 			}
 		}
 	}
@@ -127,10 +126,10 @@ func (impl *interperterImpl) format(str reflect.Value, replaceValue ...reflect.V
 	if state != passThrough {
 		switch state {
 		case bracketOpen:
-			return "", fmt.Errorf("Unclosed brackets. The following format string is invalid: '%s'", input)
+			return "", newEvaluationError(FailureReasonSyntax, "Unclosed brackets. The following format string is invalid: '%s'", input)
 
 		case bracketClose:
-			return "", fmt.Errorf("Closing bracket without opening one. The following format string is invalid: '%s'", input)
+			return "", newEvaluationError(FailureReasonSyntax, "Closing bracket without opening one. The following format string is invalid: '%s'", input)
 		}
 	}
 
@@ -159,7 +158,7 @@ func (impl *interperterImpl) toJSON(value reflect.Value) (string, error) {
 
 	json, err := json.MarshalIndent(value.Interface(), "", "  ")
 	if err != nil {
-		return "", fmt.Errorf("Cannot convert value to JSON. Cause: %v", err)
+		return "", newEvaluationError(FailureReasonEvaluation, "Cannot convert value to JSON. Cause: %v", err)
 	}
 
 	return string(json), nil
@@ -167,14 +166,14 @@ func (impl *interperterImpl) toJSON(value reflect.Value) (string, error) {
 
 func (impl *interperterImpl) fromJSON(value reflect.Value) (interface{}, error) {
 	if value.Kind() != reflect.String {
-		return nil, fmt.Errorf("Cannot parse non-string type %v as JSON", value.Kind())
+		return nil, newEvaluationError(FailureReasonTypeMismatch, "Cannot parse non-string type %v as JSON", value.Kind())
 	}
 
 	var data interface{}
 
 	err := json.Unmarshal([]byte(value.String()), &data)
 	if err != nil {
-		return nil, fmt.Errorf("Invalid JSON: %v", err)
+		return nil, newEvaluationError(FailureReasonEvaluation, "Invalid JSON: %v", err)
 	}
 
 	return data, nil
@@ -195,7 +194,7 @@ func (impl *interperterImpl) hashFiles(paths ...reflect.Value) (string, error) {
 			}
 			ps = append(ps, gitignore.ParsePattern(cleanPath, nil))
 		} else {
-			return "", fmt.Errorf("Non-string path passed to hashFiles")
+			return "", newEvaluationError(FailureReasonTypeMismatch, "Non-string path passed to hashFiles")
 		}
 	}
 
@@ -214,7 +213,7 @@ func (impl *interperterImpl) hashFiles(paths ...reflect.Value) (string, error) {
 		files = append(files, path)
 		return nil
 	}); err != nil {
-		return "", fmt.Errorf("Unable to filepath.Walk: %v", err)
+		return "", newEvaluationError(FailureReasonEvaluation, "Unable to filepath.Walk: %v", err)
 	}
 
 	if len(files) == 0 {
@@ -226,15 +225,15 @@ func (impl *interperterImpl) hashFiles(paths ...reflect.Value) (string, error) {
 	for _, file := range files {
 		f, err := os.Open(file)
 		if err != nil {
-			return "", fmt.Errorf("Unable to os.Open: %v", err)
+			return "", newEvaluationError(FailureReasonEvaluation, "Unable to os.Open: %v", err)
 		}
 
 		if _, err := io.Copy(hasher, f); err != nil {
-			return "", fmt.Errorf("Unable to io.Copy: %v", err)
+			return "", newEvaluationError(FailureReasonEvaluation, "Unable to io.Copy: %v", err)
 		}
 
 		if err := f.Close(); err != nil {
-			return "", fmt.Errorf("Unable to Close file: %v", err)
+			return "", newEvaluationError(FailureReasonEvaluation, "Unable to Close file: %v", err)
 		}
 	}
 

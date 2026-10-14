@@ -100,12 +100,19 @@ func getScriptName(rc *RunContext, step *model.Step) string {
 // OCI runtime exec failed: exec failed: container_linux.go:380: starting container process caused: exec: "${{": executable file not found in $PATH: unknown
 func (sr *stepRun) setupShellCommand(ctx context.Context) (name, script string, err error) {
 	logger := common.Logger(ctx)
-	sr.setupShell(ctx)
-	sr.setupWorkingDirectory(ctx)
+	if err = sr.setupShell(ctx); err != nil {
+		return "", "", err
+	}
+	if err = sr.setupWorkingDirectory(ctx); err != nil {
+		return "", "", err
+	}
 
 	step := sr.Step
 
-	script = sr.RunContext.NewStepExpressionEvaluator(ctx, sr).Interpolate(ctx, step.Run)
+	script, err = sr.RunContext.NewStepExpressionEvaluator(ctx, sr).Interpolate(ctx, fmt.Sprintf("steps.%s.run", step.ID), step.Run)
+	if err != nil {
+		return "", "", err
+	}
 
 	scCmd := step.ShellCommand()
 
@@ -161,7 +168,7 @@ func (l *localEnv) Getenv(name string) string {
 	return l.env[name]
 }
 
-func (sr *stepRun) setupShell(ctx context.Context) {
+func (sr *stepRun) setupShell(ctx context.Context) error {
 	rc := sr.RunContext
 	step := sr.Step
 
@@ -171,7 +178,11 @@ func (sr *stepRun) setupShell(ctx context.Context) {
 		step.WorkflowShell = step.Shell
 	}
 
-	step.WorkflowShell = rc.NewExpressionEvaluator(ctx).Interpolate(ctx, step.WorkflowShell)
+	interpolated, err := rc.NewExpressionEvaluator(ctx).Interpolate(ctx, fmt.Sprintf("steps.%s.shell", step.ID), step.WorkflowShell)
+	if err != nil {
+		return err
+	}
+	step.WorkflowShell = interpolated
 
 	if step.WorkflowShell == "" {
 		step.WorkflowShell = rc.Run.Workflow.Defaults.Run.Shell
@@ -201,9 +212,10 @@ func (sr *stepRun) setupShell(ctx context.Context) {
 	} else {
 		step.Shell = step.WorkflowShell
 	}
+	return nil
 }
 
-func (sr *stepRun) setupWorkingDirectory(ctx context.Context) {
+func (sr *stepRun) setupWorkingDirectory(ctx context.Context) error {
 	rc := sr.RunContext
 	step := sr.Step
 	workingdirectory := ""
@@ -215,11 +227,16 @@ func (sr *stepRun) setupWorkingDirectory(ctx context.Context) {
 	}
 
 	// jobs can receive context values, so we interpolate
-	workingdirectory = rc.NewExpressionEvaluator(ctx).Interpolate(ctx, workingdirectory)
+	interpolated, err := rc.NewExpressionEvaluator(ctx).Interpolate(ctx, fmt.Sprintf("steps.%s.working-directory", step.ID), workingdirectory)
+	if err != nil {
+		return err
+	}
+	workingdirectory = interpolated
 
 	// but top level keys in workflow file like `defaults` or `env` can't
 	if workingdirectory == "" {
 		workingdirectory = rc.Run.Workflow.Defaults.Run.WorkingDirectory
 	}
 	sr.WorkingDirectory = workingdirectory
+	return nil
 }

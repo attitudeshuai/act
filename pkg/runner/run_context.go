@@ -292,39 +292,64 @@ func (rc *RunContext) startJobContainer() common.Executor {
 
 		// add service containers
 		for serviceID, spec := range rc.Run.Job().Services {
+			serviceField := fmt.Sprintf("services.%s", serviceID)
+
 			// interpolate env
 			interpolatedEnvs := make(map[string]string, len(spec.Env))
 			for k, v := range spec.Env {
-				interpolatedEnvs[k] = rc.ExprEval.Interpolate(ctx, v)
+				field := fmt.Sprintf("%s.env.%s", serviceField, k)
+				interpolated, err := rc.ExprEval.Interpolate(ctx, field, v)
+				if err != nil {
+					return err
+				}
+				interpolatedEnvs[k] = interpolated
 			}
 			envs := make([]string, 0, len(interpolatedEnvs))
 			for k, v := range interpolatedEnvs {
 				envs = append(envs, fmt.Sprintf("%s=%s", k, v))
 			}
-			username, password, err = rc.handleServiceCredentials(ctx, spec.Credentials)
+			username, password, err = rc.handleServiceCredentials(ctx, serviceID, spec.Credentials)
 			if err != nil {
 				return fmt.Errorf("failed to handle service %s credentials: %w", serviceID, err)
 			}
 
 			interpolatedVolumes := make([]string, 0, len(spec.Volumes))
-			for _, volume := range spec.Volumes {
-				interpolatedVolumes = append(interpolatedVolumes, rc.ExprEval.Interpolate(ctx, volume))
+			for i, volume := range spec.Volumes {
+				field := fmt.Sprintf("%s.volumes[%d]", serviceField, i)
+				interpolated, err := rc.ExprEval.Interpolate(ctx, field, volume)
+				if err != nil {
+					return err
+				}
+				interpolatedVolumes = append(interpolatedVolumes, interpolated)
 			}
 			serviceBinds, serviceMounts := rc.GetServiceBindsAndMounts(interpolatedVolumes)
 
 			interpolatedPorts := make([]string, 0, len(spec.Ports))
-			for _, port := range spec.Ports {
-				interpolatedPorts = append(interpolatedPorts, rc.ExprEval.Interpolate(ctx, port))
+			for i, port := range spec.Ports {
+				field := fmt.Sprintf("%s.ports[%d]", serviceField, i)
+				interpolated, err := rc.ExprEval.Interpolate(ctx, field, port)
+				if err != nil {
+					return err
+				}
+				interpolatedPorts = append(interpolatedPorts, interpolated)
 			}
 			exposedPorts, portBindings, err := nat.ParsePortSpecs(interpolatedPorts)
 			if err != nil {
 				return fmt.Errorf("failed to parse service %s ports: %w", serviceID, err)
 			}
 
-			imageName := rc.ExprEval.Interpolate(ctx, spec.Image)
+			imageName, err := rc.ExprEval.Interpolate(ctx, serviceField+".image", spec.Image)
+			if err != nil {
+				return err
+			}
 			if imageName == "" {
 				logger.Infof("The service '%s' will not be started because the container definition has an empty image.", serviceID)
 				continue
+			}
+
+			serviceOptions, err := rc.ExprEval.Interpolate(ctx, serviceField+".options", spec.Options)
+			if err != nil {
+				return err
 			}
 
 			serviceContainerName := createContainerName(rc.jobContainerName(), serviceID)
@@ -342,7 +367,7 @@ func (rc *RunContext) startJobContainer() common.Executor {
 				Privileged:     rc.Config.Privileged,
 				UsernsMode:     rc.Config.UsernsMode,
 				Platform:       rc.Config.ContainerArchitecture,
-				Options:        rc.ExprEval.Interpolate(ctx, spec.Options),
+				Options:        serviceOptions,
 				NetworkMode:    networkName,
 				NetworkAliases: []string{serviceID},
 				ExposedPorts:   exposedPorts,
@@ -652,7 +677,10 @@ func (rc *RunContext) interpolateOutputs() common.Executor {
 	return func(ctx context.Context) error {
 		ee := rc.NewExpressionEvaluator(ctx)
 		for k, v := range rc.Run.Job().Outputs {
-			interpolated := ee.Interpolate(ctx, v)
+			interpolated, err := ee.Interpolate(ctx, fmt.Sprintf("outputs.%s", k), v)
+			if err != nil {
+				return err
+			}
 			if v != interpolated {
 				rc.Run.Job().Outputs[k] = interpolated
 			}
@@ -663,6 +691,12 @@ func (rc *RunContext) interpolateOutputs() common.Executor {
 
 func (rc *RunContext) startContainer() common.Executor {
 	return func(ctx context.Context) error {
+		// an interpolation failure recorded while the job was prepared
+		// (e.g. while resolving the container image or options) aborts
+		// the job in strict mode before any container is started
+		if err := rc.interpolationReporter().err(); err != nil {
+			return err
+		}
 		ctx, cancel := common.EarlyCancelContext(ctx)
 		defer cancel()
 		if rc.IsHostEnv(ctx) {
@@ -736,7 +770,9 @@ func (rc *RunContext) containerImage(ctx context.Context) string {
 
 	c := job.Container()
 	if c != nil {
-		return rc.ExprEval.Interpolate(ctx, c.Image)
+		// a failure is recorded and handled at the job execution boundary
+		image, _ := rc.ExprEval.Interpolate(ctx, "container.image", c.Image)
+		return image
 	}
 
 	return ""
@@ -784,7 +820,9 @@ func (rc *RunContext) options(ctx context.Context) string {
 	job := rc.Run.Job()
 	c := job.Container()
 	if c != nil {
-		return rc.ExprEval.Interpolate(ctx, c.Options)
+		// a failure is recorded and handled at the job execution boundary
+		options, _ := rc.ExprEval.Interpolate(ctx, "container.options", c.Options)
+		return options
 	}
 
 	return rc.Config.ContainerOptions
@@ -1109,11 +1147,20 @@ func (rc *RunContext) handleCredentials(ctx context.Context) (string, string, er
 	}
 
 	ee := rc.NewExpressionEvaluator(ctx)
-	if username = ee.Interpolate(ctx, container.Credentials["username"]); username == "" {
+	var err error
+	username, err = ee.Interpolate(ctx, "container.credentials.username", container.Credentials["username"])
+	if err != nil {
+		return "", "", err
+	}
+	if username == "" {
 		err := fmt.Errorf("failed to interpolate container.credentials.username")
 		return "", "", err
 	}
-	if password = ee.Interpolate(ctx, container.Credentials["password"]); password == "" {
+	password, err = ee.Interpolate(ctx, "container.credentials.password", container.Credentials["password"])
+	if err != nil {
+		return "", "", err
+	}
+	if password == "" {
 		err := fmt.Errorf("failed to interpolate container.credentials.password")
 		return "", "", err
 	}
@@ -1126,7 +1173,7 @@ func (rc *RunContext) handleCredentials(ctx context.Context) (string, string, er
 	return username, password, nil
 }
 
-func (rc *RunContext) handleServiceCredentials(ctx context.Context, creds map[string]string) (username, password string, err error) {
+func (rc *RunContext) handleServiceCredentials(ctx context.Context, serviceID string, creds map[string]string) (username, password string, err error) {
 	if creds == nil {
 		return
 	}
@@ -1136,12 +1183,20 @@ func (rc *RunContext) handleServiceCredentials(ctx context.Context, creds map[st
 	}
 
 	ee := rc.NewExpressionEvaluator(ctx)
-	if username = ee.Interpolate(ctx, creds["username"]); username == "" {
+	username, err = ee.Interpolate(ctx, fmt.Sprintf("services.%s.credentials.username", serviceID), creds["username"])
+	if err != nil {
+		return
+	}
+	if username == "" {
 		err = fmt.Errorf("failed to interpolate credentials.username")
 		return
 	}
 
-	if password = ee.Interpolate(ctx, creds["password"]); password == "" {
+	password, err = ee.Interpolate(ctx, fmt.Sprintf("services.%s.credentials.password", serviceID), creds["password"])
+	if err != nil {
+		return
+	}
+	if password == "" {
 		err = fmt.Errorf("failed to interpolate credentials.password")
 		return
 	}

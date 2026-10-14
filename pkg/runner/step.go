@@ -131,7 +131,12 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 			return nil
 		}
 
-		stepString := rc.ExprEval.Interpolate(ctx, stepModel.String())
+		stepString, err := rc.ExprEval.Interpolate(ctx, fmt.Sprintf("steps.%s.name", stepModel.ID), stepModel.String())
+		if err != nil {
+			stepResult.Conclusion = model.StepStatusFailure
+			stepResult.Outcome = model.StepStatusFailure
+			return err
+		}
 		if strings.Contains(stepString, "::add-mask::") {
 			stepString = "add-mask command"
 		}
@@ -175,7 +180,12 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 		stepCtx, cancelStepCtx := context.WithCancel(ctx)
 		defer cancelStepCtx()
 		var cancelTimeOut context.CancelFunc
-		stepCtx, cancelTimeOut = evaluateStepTimeout(stepCtx, rc.ExprEval, stepModel)
+		stepCtx, cancelTimeOut, err = evaluateStepTimeout(stepCtx, rc.ExprEval, stepModel)
+		if err != nil {
+			stepResult.Conclusion = model.StepStatusFailure
+			stepResult.Outcome = model.StepStatusFailure
+			return err
+		}
 		defer cancelTimeOut()
 		monitorJobCancellation(ctx, stepCtx, cctx, rc, logger, ifExpression, step, stage, cancelStepCtx)
 		startTime := time.Now()
@@ -232,14 +242,18 @@ func monitorJobCancellation(ctx context.Context, stepCtx context.Context, jobCan
 	}
 }
 
-func evaluateStepTimeout(ctx context.Context, exprEval ExpressionEvaluator, stepModel *model.Step) (context.Context, context.CancelFunc) {
-	timeout := exprEval.Interpolate(ctx, stepModel.TimeoutMinutes)
+func evaluateStepTimeout(ctx context.Context, exprEval ExpressionEvaluator, stepModel *model.Step) (context.Context, context.CancelFunc, error) {
+	timeout, err := exprEval.Interpolate(ctx, fmt.Sprintf("steps.%s.timeout-minutes", stepModel.ID), stepModel.TimeoutMinutes)
+	if err != nil {
+		return ctx, func() {}, err
+	}
 	if timeout != "" {
 		if timeOutMinutes, err := strconv.ParseInt(timeout, 10, 64); err == nil {
-			return context.WithTimeout(ctx, time.Duration(timeOutMinutes)*time.Minute)
+			c, cancel := context.WithTimeout(ctx, time.Duration(timeOutMinutes)*time.Minute)
+			return c, cancel, nil
 		}
 	}
-	return ctx, func() {}
+	return ctx, func() {}, nil
 }
 
 func setupEnv(ctx context.Context, step step) error {
@@ -252,7 +266,11 @@ func setupEnv(ctx context.Context, step step) error {
 	exprEval := rc.NewExpressionEvaluator(ctx)
 	for k, v := range *step.getEnv() {
 		if !strings.HasPrefix(k, "INPUT_") {
-			(*step.getEnv())[k] = exprEval.Interpolate(ctx, v)
+			interpolated, err := exprEval.Interpolate(ctx, fmt.Sprintf("steps.%s.env.%s", step.getStepModel().ID, k), v)
+			if err != nil {
+				return err
+			}
+			(*step.getEnv())[k] = interpolated
 		}
 	}
 	// after we have an evaluated step context, update the expressions evaluator with a new env context
@@ -260,7 +278,11 @@ func setupEnv(ctx context.Context, step step) error {
 	exprEval = rc.NewExpressionEvaluatorWithEnv(ctx, *step.getEnv())
 	for k, v := range *step.getEnv() {
 		if strings.HasPrefix(k, "INPUT_") {
-			(*step.getEnv())[k] = exprEval.Interpolate(ctx, v)
+			interpolated, err := exprEval.Interpolate(ctx, fmt.Sprintf("steps.%s.env.%s", step.getStepModel().ID, k), v)
+			if err != nil {
+				return err
+			}
+			(*step.getEnv())[k] = interpolated
 		}
 	}
 
