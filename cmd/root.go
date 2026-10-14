@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/adrg/xdg"
@@ -84,6 +85,9 @@ func createRootCommand(ctx context.Context, input *Input, version string) *cobra
 	rootCmd.Flags().BoolVarP(&input.bindWorkdir, "bind", "b", false, "bind working directory to container, rather than copy")
 	rootCmd.Flags().BoolVarP(&input.forcePull, "pull", "p", true, "pull docker image(s) even if already present")
 	rootCmd.Flags().BoolVarP(&input.forceRebuild, "rebuild", "", true, "rebuild local action docker image(s) even if already present")
+	rootCmd.Flags().IntVar(&input.pullRetries, "pull-retries", 2, "number of retries for transient image pull failures (rate limiting, connection errors, timeouts) in addition to the initial attempt; 0 disables retries")
+	rootCmd.Flags().DurationVar(&input.pullRetryDelay, "pull-retry-delay", 5*time.Second, "initial delay before retrying a failed image pull; the delay doubles after each failed attempt")
+	rootCmd.Flags().DurationVar(&input.pullRetryMaxDelay, "pull-retry-max-delay", 30*time.Second, "maximum delay between image pull retries")
 	rootCmd.Flags().BoolVarP(&input.autodetectEvent, "detect-event", "", false, "Use first event type from workflow as event that triggered the workflow")
 	rootCmd.Flags().StringVarP(&input.eventPath, "eventpath", "e", "", "path to event JSON file")
 	rootCmd.Flags().StringVar(&input.defaultBranch, "defaultbranch", "", "the name of the main branch")
@@ -394,6 +398,20 @@ func newRunCommand(ctx context.Context, input *Input) func(*cobra.Command, []str
 			log.SetFormatter(&log.JSONFormatter{})
 		}
 
+		// Validate pull retry parameters before anything else runs so that
+		// invalid configuration is reported at parameter parsing time.
+		if input.pullRetries < 0 {
+			return fmt.Errorf("number of pull retries must not be negative, got %d", input.pullRetries)
+		}
+		pullRetryConfig := container.PullRetryConfig{
+			MaxAttempts:  input.pullRetries + 1,
+			InitialDelay: input.pullRetryDelay,
+			MaxDelay:     input.pullRetryMaxDelay,
+		}
+		if err := container.ValidatePullRetryConfig(pullRetryConfig); err != nil {
+			return err
+		}
+
 		if ok, _ := cmd.Flags().GetBool("bug-report"); ok {
 			ctx, cancel := common.EarlyCancelContext(ctx)
 			defer cancel()
@@ -610,6 +628,7 @@ func newRunCommand(ctx context.Context, input *Input) func(*cobra.Command, []str
 			DefaultBranch:                      defaultbranch,
 			ForcePull:                          !input.actionOfflineMode && input.forcePull,
 			ForceRebuild:                       input.forceRebuild,
+			PullRetry:                          pullRetryConfig,
 			ReuseContainers:                    input.reuseContainers,
 			Workdir:                            input.Workdir(),
 			ActionCacheDir:                     input.actionCachePath,

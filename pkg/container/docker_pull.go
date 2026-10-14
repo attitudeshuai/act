@@ -47,31 +47,20 @@ func NewDockerPullExecutor(input NewDockerPullExecutorInput) common.Executor {
 		imageRef := cleanImage(ctx, input.Image)
 		logger.Debugf("pulling image '%v' (%s)", imageRef, input.Platform)
 
-		cli, err := GetDockerClient(ctx)
-		if err != nil {
-			return err
-		}
-		defer cli.Close()
+		cfg := normalizePullRetryConfig(input.PullRetry)
 
-		imagePullOptions, err := getImagePullOptions(ctx, input)
-		if err != nil {
-			return err
-		}
-
-		reader, err := cli.ImagePull(ctx, imageRef, imagePullOptions)
-
-		_ = logDockerResponse(logger, reader, err != nil)
-		if err != nil {
-			if imagePullOptions.RegistryAuth != "" && strings.Contains(err.Error(), "unauthorized") {
-				logger.Errorf("pulling image '%v' (%s) failed with credentials %s retrying without them, please check for stale docker config files", imageRef, input.Platform, err.Error())
-				imagePullOptions.RegistryAuth = ""
-				reader, err = cli.ImagePull(ctx, imageRef, imagePullOptions)
-
-				_ = logDockerResponse(logger, reader, err != nil)
+		// Concurrent pulls of the same image and platform in this process
+		// are deduplicated: a single actual pull runs, the other callers
+		// wait for its result.
+		return joinPullFlight(ctx, imageRef, input.Platform, func(ctx context.Context) error {
+			cli, err := GetDockerClient(ctx)
+			if err != nil {
+				return err
 			}
-			return err
-		}
-		return nil
+			defer cli.Close()
+
+			return doImagePullWithRetries(ctx, logger, cli, imageRef, input, cfg)
+		})
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 
 	docker_container "github.com/moby/moby/api/types/container"
 	"github.com/nektos/act/pkg/common"
+	"github.com/nektos/act/pkg/container"
 	"github.com/nektos/act/pkg/model"
 	log "github.com/sirupsen/logrus"
 )
@@ -31,6 +32,7 @@ type Config struct {
 	ReuseContainers                    bool                         // reuse containers to maintain state
 	ForcePull                          bool                         // force pulling of the image, even if already present
 	ForceRebuild                       bool                         // force rebuilding local docker image action
+	PullRetry                          container.PullRetryConfig    // bounded retry configuration for image pulls
 	LogOutput                          bool                         // log the output from docker run
 	JSONLogger                         bool                         // use json or text logger
 	LogPrefixJobID                     bool                         // switches from the full job name to the job id

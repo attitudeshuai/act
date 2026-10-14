@@ -111,6 +111,7 @@ func (cr *containerReference) Pull(forcePull bool) common.Executor {
 				Platform:  cr.input.Platform,
 				Username:  cr.input.Username,
 				Password:  cr.input.Password,
+				PullRetry: cr.input.PullRetry,
 			}),
 		)
 }

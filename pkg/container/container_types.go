@@ -13,6 +13,7 @@ type NewContainerInput struct {
 	Image          string
 	Username       string
 	Password       string
+	PullRetry      PullRetryConfig
 	Entrypoint     []string
 	Cmd            []string
 	WorkingDir     string
@@ -73,6 +74,7 @@ type NewDockerPullExecutorInput struct {
 	Platform  string
 	Username  string
 	Password  string
+	PullRetry PullRetryConfig
 }
 
 type Health int

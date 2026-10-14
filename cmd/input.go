@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"path/filepath"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -23,6 +24,9 @@ type Input struct {
 	dryrun                             bool
 	forcePull                          bool
 	forceRebuild                       bool
+	pullRetries                        int
+	pullRetryDelay                     time.Duration
+	pullRetryMaxDelay                  time.Duration
 	noOutput                           bool
 	envfile                            string
 	inputfile                          string

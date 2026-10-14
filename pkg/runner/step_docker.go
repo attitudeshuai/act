@@ -120,6 +120,7 @@ func (sd *stepDocker) newStepContainer(ctx context.Context, image string, cmd []
 		Image:       image,
 		Username:    rc.Config.Secrets["DOCKER_USERNAME"],
 		Password:    rc.Config.Secrets["DOCKER_PASSWORD"],
+		PullRetry:   rc.Config.PullRetry,
 		Name:        createContainerName(rc.jobContainerName(), step.ID),
 		Env:         envList,
 		Mounts:      mounts,
