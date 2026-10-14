@@ -160,6 +160,44 @@ func FindGitRef(ctx context.Context, file string) (string, error) {
 	return "", fmt.Errorf("failed to identify reference (tag/branch) for the checked-out revision '%s'", ref)
 }
 
+// FindGitDefaultBranch tries to determine the default branch of the
+// repository by resolving the symbolic remote HEAD reference
+// (refs/remotes/<remoteName>/HEAD), which is set when the remote is fetched or
+// cloned with the default refspecs. It returns an error when the repository or
+// the remote HEAD cannot be found.
+func FindGitDefaultBranch(ctx context.Context, file, remoteName string) (string, error) {
+	logger := common.Logger(ctx)
+
+	repo, err := git.PlainOpenWithOptions(
+		file,
+		&git.PlainOpenOptions{
+			DetectDotGit:          true,
+			EnableDotGitCommonDir: true,
+		},
+	)
+	if err != nil {
+		return "", err
+	}
+
+	prefix := fmt.Sprintf("refs/remotes/%s/", remoteName)
+	// resolve=true follows the symbolic ref refs/remotes/<remote>/HEAD to the
+	// remote tracking branch it points at.
+	ref, err := repo.Reference(plumbing.ReferenceName(prefix+"HEAD"), true)
+	if err != nil {
+		return "", err
+	}
+	name := ref.Name().String()
+	if !strings.HasPrefix(name, prefix) {
+		return "", fmt.Errorf("remote HEAD does not point to a branch of remote %q: %s", remoteName, name)
+	}
+	branch := strings.TrimPrefix(name, prefix)
+	if branch == "" || branch == "HEAD" {
+		return "", fmt.Errorf("invalid default branch resolved from remote HEAD: %s", name)
+	}
+	logger.Debugf("Found default branch: %s", branch)
+	return branch, nil
+}
+
 // FindGithubRepo get the repo
 func FindGithubRepo(ctx context.Context, file, githubInstance, remoteName string) (string, error) {
 	if remoteName == "" {

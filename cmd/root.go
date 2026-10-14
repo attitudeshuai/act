@@ -28,6 +28,7 @@ import (
 	"github.com/nektos/act/pkg/artifactcache"
 	"github.com/nektos/act/pkg/artifacts"
 	"github.com/nektos/act/pkg/common"
+	"github.com/nektos/act/pkg/common/git"
 	"github.com/nektos/act/pkg/container"
 	"github.com/nektos/act/pkg/gh"
 	"github.com/nektos/act/pkg/model"
@@ -123,6 +124,9 @@ func createRootCommand(ctx context.Context, input *Input, version string) *cobra
 	rootCmd.PersistentFlags().StringVarP(&input.cacheServerExternalURL, "cache-server-external-url", "", "", "Defines the external URL for if the cache server is behind a proxy. e.g.: https://act-cache-server.example.com. Be careful that there is no trailing slash.")
 	rootCmd.PersistentFlags().StringVarP(&input.cacheServerAddr, "cache-server-addr", "", common.GetOutboundIP().String(), "Defines the address to which the cache server binds.")
 	rootCmd.PersistentFlags().Uint16VarP(&input.cacheServerPort, "cache-server-port", "", 0, "Defines the port where the artifact server listens. 0 means a randomly available port.")
+	rootCmd.PersistentFlags().BoolVarP(&input.cacheServerBranchScope, "cache-server-branch-scope", "", false, "Scope cache entries by branch, like the hosted cache: caches written on a branch are only visible there, lookups fall back to the default branch.")
+	rootCmd.PersistentFlags().StringVarP(&input.cacheServerBranch, "cache-server-branch", "", "", "Overrides the branch used by the cache server for both writes and lookups. Only takes effect with --cache-server-branch-scope. Defaults to the run-side git reference.")
+	rootCmd.PersistentFlags().StringSliceVarP(&input.cacheServerFallbackBranches, "cache-server-fallback-branches", "", nil, "Comma-separated list of branches the cache server falls back to after the current branch. Only takes effect with --cache-server-branch-scope. Defaults to the default branch.")
 	rootCmd.PersistentFlags().StringVarP(&input.actionCachePath, "action-cache-path", "", filepath.Join(CacheHomeDir, "act"), "Defines the path where the actions get cached and host workspaces created.")
 	rootCmd.PersistentFlags().BoolVarP(&input.actionOfflineMode, "action-offline-mode", "", false, "If action contents exists, it will not be fetch and pull again. If turn on this, will turn off force pull")
 	rootCmd.PersistentFlags().StringVarP(&input.networkName, "network", "", "host", "Sets a docker network name. Defaults to host.")
@@ -681,8 +685,23 @@ func newRunCommand(ctx context.Context, input *Input) func(*cobra.Command, []str
 		const cacheURLKey = "ACTIONS_CACHE_URL"
 		var cacheHandler *artifactcache.Handler
 		if !input.noCacheServer && envs[cacheURLKey] == "" {
+			cacheOpts := artifactcache.Options{
+				Dir:               input.cacheServerPath,
+				CustomExternalURL: input.cacheServerExternalURL,
+				OutboundIP:        input.cacheServerAddr,
+				Port:              input.cacheServerPort,
+				Logger:            common.Logger(ctx),
+			}
+			if input.cacheServerBranchScope {
+				cacheOpts.BranchScope = true
+				// The explicit command line override applies to both writes and
+				// lookups; otherwise the branch is taken from the run-side ref.
+				cacheOpts.Branch = resolveCacheServerBranch(ctx, input, envs)
+				cacheOpts.DefaultBranch = resolveCacheServerDefaultBranch(ctx, input, defaultbranch)
+				cacheOpts.FallbackBranches = input.cacheServerFallbackBranches
+			}
 			var err error
-			cacheHandler, err = artifactcache.StartHandler(input.cacheServerPath, input.cacheServerExternalURL, input.cacheServerAddr, input.cacheServerPort, common.Logger(ctx))
+			cacheHandler, err = artifactcache.StartHandlerWithOptions(cacheOpts)
 			if err != nil {
 				return err
 			}
@@ -711,6 +730,49 @@ func newRunCommand(ctx context.Context, input *Input) func(*cobra.Command, []str
 		}
 		return plannerErr
 	}
+}
+
+// resolveCacheServerBranch determines the branch scope for the cache server.
+// An explicit command line override always wins and applies to both writes
+// and lookups; otherwise the run-side reference (GITHUB_REF/GITHUB_REF_NAME)
+// is used, and finally the current branch is detected from the git repository
+// in the working directory. An empty result makes the cache server use its
+// recognizable detached/unknown scope.
+func resolveCacheServerBranch(ctx context.Context, input *Input, envs map[string]string) string {
+	if branch := strings.TrimSpace(input.cacheServerBranch); branch != "" {
+		return branch
+	}
+	if ref := strings.TrimSpace(envs["GITHUB_REF"]); strings.HasPrefix(ref, "refs/heads/") {
+		return ref
+	}
+	if refType := strings.TrimSpace(envs["GITHUB_REF_TYPE"]); refType == "" || refType == "branch" {
+		if name := strings.TrimSpace(envs["GITHUB_REF_NAME"]); name != "" {
+			return name
+		}
+	}
+	if ref, err := git.FindGitRef(ctx, input.Workdir()); err == nil {
+		// NormalizeBranch maps tags/pull refs to the detached scope.
+		return ref
+	}
+	return ""
+}
+
+// resolveCacheServerDefaultBranch determines the default branch used as the
+// first cache fallback scope: the --defaultbranch flag wins, otherwise the
+// remote HEAD of the repository is consulted, and it finally falls back to
+// "main".
+func resolveCacheServerDefaultBranch(ctx context.Context, input *Input, defaultBranch string) string {
+	if branch := strings.TrimSpace(defaultBranch); branch != "" {
+		return branch
+	}
+	remoteName := input.remoteName
+	if remoteName == "" {
+		remoteName = "origin"
+	}
+	if branch, err := git.FindGitDefaultBranch(ctx, input.Workdir(), remoteName); err == nil && branch != "" {
+		return branch
+	}
+	return "main"
 }
 
 func defaultImageSurvey(actrc string) error {

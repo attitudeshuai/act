@@ -49,6 +49,9 @@ type Input struct {
 	cacheServerExternalURL             string
 	cacheServerAddr                    string
 	cacheServerPort                    uint16
+	cacheServerBranchScope             bool
+	cacheServerBranch                  string
+	cacheServerFallbackBranches        []string
 	jsonLogger                         bool
 	noSkipCheckout                     bool
 	remoteName                         string

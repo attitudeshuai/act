@@ -24,7 +24,11 @@ func (c *Request) ToCache() *Cache {
 }
 
 type Cache struct {
-	ID        uint64 `json:"id" boltholdKey:"ID"`
+	ID uint64 `json:"id" boltholdKey:"ID"`
+	// Branch records the branch the cache was written from when branch scoping
+	// is enabled. It stays empty in flat mode and for entries written by older
+	// versions of act; such legacy entries are treated as default-branch entries.
+	Branch    string `json:"branch,omitempty" boltholdIndex:"Branch"`
 	Key       string `json:"key" boltholdIndex:"Key"`
 	Version   string `json:"version" boltholdIndex:"Version"`
 	Size      int64  `json:"cacheSize"`

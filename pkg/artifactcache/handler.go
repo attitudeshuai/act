@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -43,10 +44,51 @@ type Handler struct {
 	outboundIP        string
 	customExternalURL string
 	token             string
+
+	// branchScope enables branch-scoped cache semantics. When it is false the
+	// cache is completely flat and behaves exactly like the unscoped cache:
+	// no branch is recorded on write and the branch is ignored on lookup.
+	branchScope bool
+	// branch is the current branch scope, applied to both writes and lookups.
+	branch string
+	// defaultBranch is the scope legacy branchless entries belong to and the
+	// first branch consulted by the fallback chain.
+	defaultBranch string
+	// scopes is the ordered lookup scope chain (current branch first).
+	scopes []branchScope
+}
+
+// Options configures a Handler. The zero value keeps the historical flat cache
+// behavior, with the home directory as cache dir.
+type Options struct {
+	Dir               string
+	CustomExternalURL string
+	OutboundIP        string
+	Port              uint16
+	Logger            logrus.FieldLogger
+	BranchScope       bool
+	Branch            string
+	DefaultBranch     string
+	FallbackBranches  []string
 }
 
 func StartHandler(dir, customExternalURL string, outboundIP string, port uint16, logger logrus.FieldLogger) (*Handler, error) {
+	return StartHandlerWithOptions(Options{
+		Dir:               dir,
+		CustomExternalURL: customExternalURL,
+		OutboundIP:        outboundIP,
+		Port:              port,
+		Logger:            logger,
+	})
+}
+
+func StartHandlerWithOptions(opts Options) (*Handler, error) {
 	h := &Handler{}
+	dir := opts.Dir
+	customExternalURL := opts.CustomExternalURL
+	outboundIP := opts.OutboundIP
+	port := opts.Port
+	logger := opts.Logger
 
 	if logger == nil {
 		discard := logrus.New()
@@ -56,6 +98,24 @@ func StartHandler(dir, customExternalURL string, outboundIP string, port uint16,
 	logger = logger.WithField("module", "artifactcache")
 	h.logger = logger
 
+	if opts.BranchScope {
+		h.branchScope = true
+		h.branch = NormalizeBranch(opts.Branch)
+		if strings.TrimSpace(opts.DefaultBranch) == "" {
+			h.defaultBranch = defaultFallbackBranch
+		} else {
+			h.defaultBranch = NormalizeBranch(opts.DefaultBranch)
+		}
+		h.scopes = buildLookupScopes(h.branch, h.defaultBranch, opts.FallbackBranches)
+		fallbacks := make([]string, 0, len(h.scopes)-1)
+		for _, scope := range h.scopes[1:] {
+			fallbacks = append(fallbacks, scope.branch)
+		}
+		logger.Infof("cache branch scope enabled, current branch %q, fallback branches %v", h.branch, fallbacks)
+		if h.branch == DetachedHeadScope {
+			logger.Warnf("unable to determine the current branch; caches are written to the %q scope and lookups fall back to %v", DetachedHeadScope, fallbacks)
+		}
+	}
 	if dir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -190,7 +250,13 @@ func (h *Handler) find(w http.ResponseWriter, r *http.Request, _ httprouter.Para
 	}
 	defer db.Close()
 
-	cache, err := findCache(db, keys, version)
+	// With branch scoping disabled, an empty scope list means flat matching:
+	// the branch is ignored entirely, which keeps the historical behavior.
+	var scopes []branchScope
+	if h.branchScope {
+		scopes = h.scopes
+	}
+	cache, hitScope, err := findCache(db, keys, version, scopes)
 	if err != nil {
 		h.responseJSON(w, r, 500, err)
 		return
@@ -208,11 +274,24 @@ func (h *Handler) find(w http.ResponseWriter, r *http.Request, _ httprouter.Para
 		h.responseJSON(w, r, 204)
 		return
 	}
-	h.responseJSON(w, r, 200, map[string]any{
+	if h.branchScope {
+		if hitScope != h.branch {
+			h.logger.Infof("cache hit for key %q from fallback branch %q (current branch %q)", cache.Key, hitScope, h.branch)
+		} else {
+			h.logger.Infof("cache hit for key %q on branch %q", cache.Key, hitScope)
+		}
+	}
+	response := map[string]any{
 		"result":          "hit",
 		"archiveLocation": fmt.Sprintf("%s%s/artifacts/%d", h.ExternalURL(), apiPath, cache.ID),
 		"cacheKey":        cache.Key,
-	})
+	}
+	if h.branchScope {
+		// hitScope reports the actual source of the hit; for a legacy
+		// branchless entry it is the default branch.
+		response["cacheBranch"] = hitScope
+	}
+	h.responseJSON(w, r, 200, response)
 }
 
 // POST /_apis/artifactcache/caches
@@ -226,6 +305,9 @@ func (h *Handler) reserve(w http.ResponseWriter, r *http.Request, _ httprouter.P
 	api.Key = strings.ToLower(api.Key)
 
 	cache := api.ToCache()
+	if h.branchScope {
+		cache.Branch = h.branch
+	}
 	db, err := h.openDB()
 	if err != nil {
 		h.responseJSON(w, r, 500, err)
@@ -368,37 +450,62 @@ func (h *Handler) middleware(handler httprouter.Handle) httprouter.Handle {
 	}
 }
 
-// if not found, return (nil, nil) instead of an error.
-func findCache(db *bolthold.Store, keys []string, version string) (*Cache, error) {
-	cache := &Cache{}
-	for _, prefix := range keys {
-		// if a key in the list matches exactly, don't return partial matches
-		if err := db.FindOne(cache,
-			bolthold.Where("Key").Eq(prefix).
-				And("Version").Eq(version).
-				And("Complete").Eq(true).
-				SortBy("CreatedAt").Reverse()); err == nil || !errors.Is(err, bolthold.ErrNotFound) {
+// if not found, return (nil, "", nil) instead of an error. The returned scope
+// name is the branch the hit came from ("" in flat mode).
+func findCache(db *bolthold.Store, keys []string, version string, scopes []branchScope) (*Cache, string, error) {
+	if len(scopes) == 0 {
+		// Flat mode: a single universal scope, matching the historical behavior.
+		scopes = []branchScope{{all: true}}
+	}
+	for _, scope := range scopes {
+		for _, key := range keys {
+			// if a key in the list matches exactly, don't return partial matches
+			cache, err := findOneInScope(db, key, version, scope)
 			if err != nil {
-				return nil, fmt.Errorf("find cache: %w", err)
+				return nil, "", err
 			}
+			if cache != nil {
+				return cache, scope.branch, nil
+			}
+		}
+	}
+	return nil, "", nil
+}
+
+// findOneInScope looks up one key within a scope, preferring exact matches
+// over prefix matches.
+func findOneInScope(db *bolthold.Store, key, version string, scope branchScope) (*Cache, error) {
+	if cache, err := queryLatestCache(db, bolthold.Where("Key").Eq(key), version, scope); err != nil || cache != nil {
+		return cache, err
+	}
+	prefixPattern := fmt.Sprintf("^%s", regexp.QuoteMeta(key))
+	re, err := regexp.Compile(prefixPattern)
+	if err != nil {
+		return nil, nil
+	}
+	return queryLatestCache(db, bolthold.Where("Key").RegExp(re), version, scope)
+}
+
+// queryLatestCache returns the newest completed cache matching the key query
+// and the scope. Scope filtering happens in Go (rather than via a bolthold
+// criterion) so legacy entries without a recorded branch are found even when
+// the Branch index has not been built for them yet.
+func queryLatestCache(db *bolthold.Store, keyQuery *bolthold.Query, version string, scope branchScope) (*Cache, error) {
+	var caches []*Cache
+	err := db.Find(&caches, keyQuery.
+		And("Version").Eq(version).
+		And("Complete").Eq(true).
+		SortBy("CreatedAt").Reverse())
+	if err != nil {
+		if errors.Is(err, bolthold.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("find cache: %w", err)
+	}
+	for _, cache := range caches {
+		if scope.matches(cache.Branch) {
 			return cache, nil
 		}
-		prefixPattern := fmt.Sprintf("^%s", regexp.QuoteMeta(prefix))
-		re, err := regexp.Compile(prefixPattern)
-		if err != nil {
-			continue
-		}
-		if err := db.FindOne(cache,
-			bolthold.Where("Key").RegExp(re).
-				And("Version").Eq(version).
-				And("Complete").Eq(true).
-				SortBy("CreatedAt").Reverse()); err != nil {
-			if errors.Is(err, bolthold.ErrNotFound) {
-				continue
-			}
-			return nil, fmt.Errorf("find cache: %w", err)
-		}
-		return cache, nil
 	}
 	return nil, nil
 }
@@ -511,7 +618,9 @@ func (h *Handler) gcCache() {
 
 	// Remove the old caches with the same key and version, keep the latest one.
 	// Also keep the olds which have been used recently for a while in case of the cache is still in use.
-	if results, err := db.FindAggregate(
+	if h.branchScope {
+		h.gcDedupBranchCaches(db)
+	} else if results, err := db.FindAggregate(
 		&Cache{},
 		bolthold.Where("Complete").Eq(true),
 		"Key", "Version",
@@ -538,6 +647,57 @@ func (h *Handler) gcCache() {
 				}
 				h.logger.Infof("deleted cache: %+v", cache)
 			}
+		}
+	}
+}
+
+type dedupGroupKey struct {
+	branch  string
+	key     string
+	version string
+}
+
+// gcDedupBranchCaches removes older duplicates of a key/version within each
+// branch scope, keeping the newest entry. Legacy branchless entries are
+// grouped under the default branch, matching how they are treated on lookup.
+// Entries of other branches are never touched, so deleting one branch's
+// entries cannot affect the same key stored on another branch.
+func (h *Handler) gcDedupBranchCaches(db *bolthold.Store) {
+	var caches []*Cache
+	if err := db.Find(&caches, bolthold.Where("Complete").Eq(true)); err != nil && !errors.Is(err, bolthold.ErrNotFound) {
+		h.logger.Warnf("find caches: %v", err)
+		return
+	}
+
+	groups := make(map[dedupGroupKey][]*Cache)
+	for _, cache := range caches {
+		branch := cache.Branch
+		if branch == "" {
+			branch = h.defaultBranch
+		}
+		key := dedupGroupKey{branch: branch, key: cache.Key, version: cache.Version}
+		groups[key] = append(groups[key], cache)
+	}
+
+	for _, group := range groups {
+		if len(group) <= 1 {
+			continue
+		}
+		sort.Slice(group, func(i, j int) bool {
+			return group[i].CreatedAt < group[j].CreatedAt
+		})
+		for _, cache := range group[:len(group)-1] {
+			if time.Since(time.Unix(cache.UsedAt, 0)) < keepOld {
+				// Keep it since it has been used recently, even if it's old.
+				// Or it could break downloading in process.
+				continue
+			}
+			h.storage.Remove(cache.ID)
+			if err := db.Delete(cache.ID, cache); err != nil {
+				h.logger.Warnf("delete cache: %v", err)
+				continue
+			}
+			h.logger.Infof("deleted cache: %+v", cache)
 		}
 	}
 }

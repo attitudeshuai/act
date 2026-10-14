@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"testing"
 
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -273,5 +275,39 @@ func TestCloneIfRequired(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, remote.Config().URLs, 1)
 		assert.Equal(t, "https://github.com/actions/setup-go", remote.Config().URLs[0])
+	})
+}
+
+func TestFindGitDefaultBranch(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("resolves symbolic remote HEAD", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "repo")
+		repo, err := gogit.PlainInit(dir, false)
+		require.NoError(t, err)
+		hash := plumbing.NewHash("0123456789012345678901234567890123456789")
+		require.NoError(t, repo.Storer.SetReference(
+			plumbing.NewReferenceFromStrings("refs/remotes/origin/main", hash.String())))
+		require.NoError(t, repo.Storer.SetReference(
+			plumbing.NewSymbolicReference(
+				plumbing.ReferenceName("refs/remotes/origin/HEAD"),
+				plumbing.ReferenceName("refs/remotes/origin/main"))))
+
+		branch, err := FindGitDefaultBranch(ctx, dir, "origin")
+		require.NoError(t, err)
+		assert.Equal(t, "main", branch)
+	})
+
+	t.Run("missing remote head", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "repo")
+		_, err := gogit.PlainInit(dir, false)
+		require.NoError(t, err)
+		_, err = FindGitDefaultBranch(ctx, dir, "origin")
+		assert.Error(t, err)
+	})
+
+	t.Run("not a git repo", func(t *testing.T) {
+		_, err := FindGitDefaultBranch(ctx, t.TempDir(), "origin")
+		assert.Error(t, err)
 	})
 }
