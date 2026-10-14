@@ -755,6 +755,9 @@ func TestRunActionInputs(t *testing.T) {
 	}
 
 	inputs := map[string]string{
+		"NAME":       "act",
+		"SOME_VALUE": "input",
+		// undeclared input: warned about and ignored by default
 		"SOME_INPUT": "input",
 	}
 

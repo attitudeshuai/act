@@ -62,6 +62,7 @@ type Config struct {
 	ContainerNetworkMode               docker_container.NetworkMode // the network mode of job containers (the value of --network)
 	ActionCache                        ActionCache                  // Use a custom ActionCache Implementation
 	ConcurrentJobs                     int                          // Number of max concurrent jobs
+	UnknownInputs                      string                       // how to handle inputs that are not declared by the workflow: UnknownInputsPolicyWarn (default) or UnknownInputsPolicyError
 }
 
 func (config *Config) GetConcurrentJobs() int {
@@ -121,6 +122,12 @@ func (runner *runnerImpl) configure() (Runner, error) {
 // NewPlanExecutor ...
 func (runner *runnerImpl) NewPlanExecutor(plan *model.Plan) common.Executor {
 	maxJobNameLen := 0
+
+	// Validate declared inputs after the workflows have been loaded and
+	// before any job (including reusable workflow jobs) is started.
+	inputValidationExecutor := func(ctx context.Context) error {
+		return runner.validatePlanInputs(ctx, plan)
+	}
 
 	stagePipeline := make([]common.Executor, 0)
 	log.Debugf("Plan Stages: %v", plan.Stages)
@@ -215,7 +222,7 @@ func (runner *runnerImpl) NewPlanExecutor(plan *model.Plan) common.Executor {
 		})
 	}
 
-	return common.NewPipelineExecutor(stagePipeline...).Then(handleFailure(plan))
+	return common.NewPipelineExecutor(inputValidationExecutor, common.NewPipelineExecutor(stagePipeline...).Then(handleFailure(plan)))
 }
 
 func handleFailure(plan *model.Plan) common.Executor {

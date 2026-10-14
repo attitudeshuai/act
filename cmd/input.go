@@ -64,6 +64,7 @@ type Input struct {
 	listOptions                        bool
 	validate                           bool
 	strict                             bool
+	unknownInputs                      string
 	concurrentJobs                     int
 }
 
