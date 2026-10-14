@@ -805,3 +805,41 @@ func TestRunMatrixWithUserDefinedInclusions(t *testing.T) {
 
 	tjfi.runTest(context.Background(), t, &Config{Matrix: matrix})
 }
+
+func TestHandleFailure(t *testing.T) {
+	newPlan := func(results ...string) *model.Plan {
+		runs := make([]*model.Run, 0, len(results))
+		jobs := map[string]*model.Job{}
+		for i, result := range results {
+			jobID := fmt.Sprintf("job%d", i)
+			jobs[jobID] = &model.Job{Result: result}
+			runs = append(runs, &model.Run{
+				Workflow: &model.Workflow{Jobs: jobs},
+				JobID:    jobID,
+			})
+		}
+		return &model.Plan{Stages: []*model.Stage{{Runs: runs}}}
+	}
+
+	table := []struct {
+		name    string
+		results []string
+		wantErr string
+	}{
+		{name: "allSucceeded", results: []string{"success", "", "skipped"}, wantErr: ""},
+		{name: "failure", results: []string{"success", "failure"}, wantErr: "Job 'job1' failed"},
+		{name: "timedOut", results: []string{"success", "timed_out"}, wantErr: "Job 'job1' timed out"},
+		{name: "timedOutDistinctFromFailure", results: []string{"timed_out", "failure"}, wantErr: "Job 'job0' timed out"},
+	}
+
+	for _, tt := range table {
+		t.Run(tt.name, func(t *testing.T) {
+			err := handleFailure(newPlan(tt.results...))(context.Background())
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErr)
+			}
+		})
+	}
+}

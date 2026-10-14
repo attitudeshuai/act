@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/docker/go-connections/nat"
@@ -52,6 +53,8 @@ type RunContext struct {
 	cleanUpJobContainer common.Executor
 	caller              *caller // job calling this RunContext (reusable workflows)
 	Cancelled           bool
+	TimedOut            bool
+	runningStep         atomic.Pointer[string]
 	nodeToolFullPath    string
 }
 
@@ -699,6 +702,30 @@ func (rc *RunContext) result(result string) {
 	rc.Run.Job().Result = result
 }
 
+// setRunningStep records the step that is currently executing. The atomic copy
+// can safely be read from the job timeout watcher goroutine.
+func (rc *RunContext) setRunningStep(id string) {
+	rc.runningStep.Store(&id)
+}
+
+// runningStepName returns a human readable name of the step that is currently
+// executing, or an empty string if no step is running.
+func (rc *RunContext) runningStepName() string {
+	id := rc.CurrentStep
+	if pointer := rc.runningStep.Load(); pointer != nil {
+		id = *pointer
+	}
+	if id == "" {
+		return ""
+	}
+	for _, step := range rc.Run.Job().Steps {
+		if step != nil && step.ID == id {
+			return step.String()
+		}
+	}
+	return id
+}
+
 func (rc *RunContext) steps() []*model.Step {
 	return rc.Run.Job().Steps
 }
@@ -861,6 +888,12 @@ func (rc *RunContext) getJobContext() *model.JobContext {
 	jobStatus := "success"
 	if rc.Cancelled {
 		jobStatus = "cancelled"
+	} else if rc.TimedOut {
+		// a timeout is an unsuccessful termination, but it is not a manual
+		// cancellation, so success()/failure() evaluate accordingly while
+		// cancelled() stays false; the distinct conclusion lives in the job
+		// result visible via needs
+		jobStatus = "failure"
 	} else {
 		for _, stepStatus := range rc.StepResults {
 			if stepStatus.Conclusion == model.StepStatusFailure {

@@ -99,6 +99,7 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 
 		ifExpression := step.getIfExpression(ctx, stage)
 		rc.CurrentStep = stepModel.ID
+		rc.setRunningStep(stepModel.ID)
 
 		stepResult := &model.StepResult{
 			Outcome:    model.StepStatusSuccess,
@@ -181,6 +182,19 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 		startTime := time.Now()
 		err = executor(stepCtx)
 		executionTime := time.Since(startTime)
+
+		if common.IsJobTimedOut(ctx) {
+			// the job-level timeout-minutes deadline fired while this step
+			// was running; the step is cancelled, not failed, and
+			// continue-on-error must not turn it into a success
+			stepResult.Outcome = model.StepStatusCancelled
+			stepResult.Conclusion = model.StepStatusCancelled
+			logger.WithFields(logrus.Fields{"executionTime": executionTime, "stepResult": stepResult.Outcome}).Infof("  \u23F9  Cancelled - %s %s [%s]", stage, stepString, executionTime)
+			if err == nil {
+				err = context.Canceled
+			}
+			return err
+		}
 
 		if err == nil {
 			logger.WithFields(logrus.Fields{"executionTime": executionTime, "stepResult": stepResult.Outcome}).Infof("  \u2705  Success - %s %s [%s]", stage, stepString, executionTime)

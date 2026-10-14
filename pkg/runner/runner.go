@@ -222,8 +222,11 @@ func handleFailure(plan *model.Plan) common.Executor {
 	return func(_ context.Context) error {
 		for _, stage := range plan.Stages {
 			for _, run := range stage.Runs {
-				if run.Job().Result == "failure" {
+				switch run.Job().Result {
+				case "failure":
 					return fmt.Errorf("Job '%s' failed", run.String())
+				case jobResultTimedOut:
+					return fmt.Errorf("Job '%s' timed out", run.String())
 				}
 			}
 		}

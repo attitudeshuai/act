@@ -3,11 +3,28 @@ package runner
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nektos/act/pkg/common"
+	"github.com/nektos/act/pkg/exprparser"
 	"github.com/nektos/act/pkg/model"
+	log "github.com/sirupsen/logrus"
 )
+
+// jobResultTimedOut is the distinct conclusion of a job that was terminated
+// because it exceeded its declared timeout-minutes. It is intentionally
+// different from "failure" and from a manual "cancelled" termination and is
+// visible to downstream jobs via the needs context.
+const jobResultTimedOut = "timed_out"
+
+// jobTimeoutDuration converts the declared timeout-minutes into the actual
+// deadline; it exists as a package level function so tests can shrink the
+// deadline.
+var jobTimeoutDuration = func(timeoutMinutes int64) time.Duration {
+	return time.Duration(timeoutMinutes) * time.Minute
+}
 
 type jobInfo interface {
 	matrix() map[string]interface{}
@@ -119,8 +136,12 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 	}
 
 	var setJobResultExecutor common.Executor = func(ctx context.Context) error {
+		jobTimedOut := common.IsJobTimedOut(ctx)
 		jobError := common.JobError(ctx)
-		setJobResult(ctx, info, rc, jobError == nil)
+		if jobTimedOut {
+			markSkippedStepsForJobTimeout(ctx, rc, info)
+		}
+		setJobResult(ctx, info, rc, jobError == nil, jobTimedOut)
 		setJobOutputs(ctx, rc)
 		return nil
 	}
@@ -129,7 +150,7 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 	pipeline = append(pipeline, preSteps...)
 	pipeline = append(pipeline, steps...)
 
-	return common.NewPipelineExecutor(
+	jobPipeline := common.NewPipelineExecutor(
 		common.NewFieldExecutor("step", "Set up job", common.NewFieldExecutor("stepid", []string{"--setup-job"},
 			common.NewPipelineExecutor(common.NewInfoExecutor("\u2B50 Run Set up job"), info.startContainer(), rc.InitializeNodeTool()).
 				Then(common.NewFieldExecutor("stepResult", model.StepStatusSuccess, common.NewInfoExecutor("  \u2705  Success - Set up job"))).
@@ -152,20 +173,152 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 						info.interpolateOutputs().Finally(info.closeContainer()).Then(common.NewFieldExecutor("stepResult", model.StepStatusSuccess, common.NewInfoExecutor("  \u2705  Success - Complete job"))).
 							OnError(common.NewFieldExecutor("stepResult", model.StepStatusFailure, common.NewInfoExecutor("  \u274C  Failure - Complete job"))),
 					))))).Finally(setJobResultExecutor)
+
+	return func(ctx context.Context) error {
+		// evaluate the job-level timeout-minutes before the job (and its
+		// containers) starts; an invalid declaration aborts the job up front
+		timeoutMinutes, hasTimeout, err := evaluateJobTimeoutMinutes(ctx, rc)
+		if err != nil {
+			common.Logger(ctx).Errorf("%v", err)
+			return err
+		}
+		if !hasTimeout {
+			return jobPipeline(ctx)
+		}
+		return executeJobWithTimeout(ctx, rc, jobTimeoutDuration(timeoutMinutes), jobPipeline)
+	}
 }
 
-func setJobResult(ctx context.Context, info jobInfo, rc *RunContext, success bool) {
+// evaluateJobTimeoutMinutes evaluates the job-level `timeout-minutes`
+// declaration. A missing declaration or an expression that evaluates to an
+// empty string means "no limit" (same behaviour as having no declaration).
+// A declaration that fails to evaluate, or that yields anything other than a
+// positive integer, is an error naming the job and the raw declaration.
+func evaluateJobTimeoutMinutes(ctx context.Context, rc *RunContext) (int64, bool, error) {
+	raw := strings.TrimSpace(rc.Run.Job().TimeoutMinutes)
+	if raw == "" {
+		return 0, false, nil
+	}
+
+	value := raw
+	if strings.Contains(raw, "${{") && strings.Contains(raw, "}}") {
+		expr, _ := rewriteSubExpression(ctx, raw, true)
+		evaluated, err := rc.ExprEval.evaluate(ctx, expr, exprparser.DefaultStatusCheckNone)
+		if err != nil {
+			return 0, false, fmt.Errorf("unable to evaluate 'timeout-minutes: %s' for job '%s': %w", raw, rc.JobName, err)
+		}
+		value = fmt.Sprintf("%v", evaluated)
+	}
+
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false, nil
+	}
+
+	timeoutMinutes, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, false, fmt.Errorf("invalid 'timeout-minutes: %s' for job '%s': value must be a positive integer", raw, rc.JobName)
+	}
+	if timeoutMinutes <= 0 {
+		return 0, false, fmt.Errorf("invalid 'timeout-minutes: %s' for job '%s': value must be greater than zero", raw, rc.JobName)
+	}
+	return timeoutMinutes, true, nil
+}
+
+// executeJobWithTimeout runs the job pipeline under a job-scoped deadline.
+// When the deadline fires it records the timeout, logs it and cancels the job
+// context (which stops the running step and prevents new steps from
+// starting); the job itself concludes with timed_out and the plan-level
+// handleFailure turns that conclusion into a failed run. An external
+// cancellation that arrives first wins: only one of the two signals
+// terminates the job and the timeout is not reported in that case.
+//
+// Each matrix instance gets its own invocation, so the deadline is scoped to a
+// single instance and cancelling it never cancels sibling instances.
+func executeJobWithTimeout(ctx context.Context, rc *RunContext, timeout time.Duration, jobPipeline common.Executor) error {
+	logger := common.Logger(ctx)
+	timeoutSignal, markTimedOut := context.WithCancel(context.Background())
+	ctx = common.WithJobTimeoutContext(ctx, timeoutSignal)
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+
+	go func() {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			step := rc.runningStepName()
+			if step == "" {
+				// the deadline fired before the first step started, e.g. while
+				// pulling images or starting containers
+				step = "Set up job"
+			}
+			logger.WithFields(log.Fields{
+				"jobResult":      jobResultTimedOut,
+				"timeoutMinutes": int64(timeout / time.Minute),
+				"step":           step,
+			}).Errorf("\u23F1 Job '%s' timed out after %d minute(s) while running step '%s'", rc.JobName, int64(timeout/time.Minute), step)
+			// set the state and signal the timeout first, then cancel the job
+			// context, so everything observing the cancellation also sees the
+			// timeout marker
+			rc.TimedOut = true
+			markTimedOut()
+			cancelRun()
+		case <-runCtx.Done():
+		}
+	}()
+
+	err := jobPipeline(runCtx)
+	if timeoutSignal.Err() != nil {
+		// a timeout is a terminal job conclusion, just like a step failure it
+		// must not short-circuit the plan: sibling jobs and downstream stages
+		// keep running and observe the conclusion via needs; the plan-level
+		// handleFailure turns the timed_out conclusion into a failed run
+		return nil
+	}
+	return err
+}
+
+// markSkippedStepsForJobTimeout marks every main step that never got a result
+// because the job timed out as skipped. The step that was running is already
+// marked cancelled by runStepExecutor.
+func markSkippedStepsForJobTimeout(ctx context.Context, rc *RunContext, info jobInfo) {
+	logger := common.Logger(ctx)
+	for _, stepModel := range info.steps() {
+		if stepModel == nil {
+			continue
+		}
+		if _, ok := rc.StepResults[stepModel.ID]; ok {
+			continue
+		}
+		rc.StepResults[stepModel.ID] = &model.StepResult{
+			Outcome:    model.StepStatusSkipped,
+			Conclusion: model.StepStatusSkipped,
+			Outputs:    make(map[string]string),
+		}
+		logger.WithField("stepResult", model.StepStatusSkipped).Infof("  \u23ED  Skipped - Main %s (job timed out before the step started)", stepModel.String())
+	}
+}
+
+func setJobResult(ctx context.Context, info jobInfo, rc *RunContext, success bool, timedOut bool) {
 	logger := common.Logger(ctx)
 
 	jobResult := "success"
-	// we have only one result for a whole matrix build, so we need
-	// to keep an existing result state if we run a matrix
-	if len(info.matrix()) > 0 && rc.Run.Job().Result != "" {
-		jobResult = rc.Run.Job().Result
+	switch {
+	case timedOut:
+		jobResult = jobResultTimedOut
+	case !success:
+		jobResult = "failure"
 	}
 
-	if !success {
-		jobResult = "failure"
+	// we have only one result for a whole matrix build, so keep an already
+	// reached terminal conclusion; a later failure/timeout only worsens a
+	// still successful aggregate result
+	if len(info.matrix()) > 0 && rc.Run.Job().Result != "" {
+		existing := rc.Run.Job().Result
+		if isTerminalJobResult(existing) || jobResult == "success" {
+			jobResult = existing
+		}
 	}
 
 	info.result(jobResult)
@@ -175,11 +328,18 @@ func setJobResult(ctx context.Context, info jobInfo, rc *RunContext, success boo
 	}
 
 	jobResultMessage := "succeeded"
-	if jobResult != "success" {
+	switch jobResult {
+	case "failure":
 		jobResultMessage = "failed"
+	case jobResultTimedOut:
+		jobResultMessage = "timed out"
 	}
 
 	logger.WithField("jobResult", jobResult).Infof("\U0001F3C1  Job %s", jobResultMessage)
+}
+
+func isTerminalJobResult(result string) bool {
+	return result == "failure" || result == jobResultTimedOut
 }
 
 func setJobOutputs(ctx context.Context, rc *RunContext) {

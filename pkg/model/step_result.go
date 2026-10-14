@@ -8,12 +8,14 @@ const (
 	StepStatusSuccess stepStatus = iota
 	StepStatusFailure
 	StepStatusSkipped
+	StepStatusCancelled
 )
 
 var stepStatusStrings = [...]string{
 	"success",
 	"failure",
 	"skipped",
+	"cancelled",
 }
 
 func (s stepStatus) MarshalText() ([]byte, error) {

@@ -12,6 +12,10 @@ type jobCancelCtx string
 
 const JobCancelCtxVal = jobCancelCtx("job.cancel")
 
+type jobTimeoutCtx string
+
+const jobTimeoutCtxVal = jobTimeoutCtx("job.timeout")
+
 // JobError returns the job error for current context if any
 func JobError(ctx context.Context) error {
 	val := ctx.Value(jobErrorContextKeyVal)
@@ -63,4 +67,28 @@ func EarlyCancelContext(ctx context.Context) (context.Context, context.CancelFun
 		return context, cancel
 	}
 	return ctx, func() {}
+}
+
+// WithJobTimeoutContext stores a context that is canceled exactly when the
+// job-level timeout-minutes deadline is reached. It lets running steps
+// distinguish a job timeout from other cancellations.
+func WithJobTimeoutContext(ctx context.Context, timeoutContext context.Context) context.Context {
+	return context.WithValue(ctx, jobTimeoutCtxVal, timeoutContext)
+}
+
+// JobTimeoutContext returns the job timeout context stored in ctx, if any.
+func JobTimeoutContext(ctx context.Context) context.Context {
+	val := ctx.Value(jobTimeoutCtxVal)
+	if val != nil {
+		if timeoutContext, ok := val.(context.Context); ok {
+			return timeoutContext
+		}
+	}
+	return nil
+}
+
+// IsJobTimedOut reports whether the job-level timeout-minutes deadline fired.
+func IsJobTimedOut(ctx context.Context) bool {
+	timeoutContext := JobTimeoutContext(ctx)
+	return timeoutContext != nil && timeoutContext.Err() != nil
 }
